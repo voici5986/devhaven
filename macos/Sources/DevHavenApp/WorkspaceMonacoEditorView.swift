@@ -2,6 +2,10 @@ import SwiftUI
 import WebKit
 import DevHavenCore
 
+extension EnvironmentValues {
+    @Entry var workspaceRetainedTabIsVisible = true
+}
+
 struct WorkspaceMonacoEditorHighlightPayload: Codable, Equatable {
     var kind: String
     var startLine: Int
@@ -53,13 +57,50 @@ struct WorkspaceMonacoEditorPayload: Codable, Equatable {
 }
 
 @MainActor
-final class WorkspaceMonacoEditorBridge: NSObject, ObservableObject, WKScriptMessageHandler {
+private final class WorkspaceMonacoEditorScriptMessageHandler: NSObject, WKScriptMessageHandler {
+    weak var bridge: WorkspaceMonacoEditorBridge?
+
+    init(bridge: WorkspaceMonacoEditorBridge) {
+        self.bridge = bridge
+    }
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        bridge?.handleScriptMessage(message)
+    }
+}
+
+@MainActor
+protocol WorkspaceMonacoWebViewLifecycle: AnyObject {
+    var webView: WKWebView { get }
+
+    func activate()
+    func tearDown()
+}
+
+extension WorkspaceMonacoWebViewLifecycle {
+    func setHostVisibility(_ isVisible: Bool) {
+        let window = webView.window
+        let firstResponderView = window?.firstResponder as? NSView
+        let ownsFirstResponder = firstResponderView.map { responderView in
+            responderView === webView || responderView.isDescendant(of: webView)
+        } ?? false
+
+        webView.isHidden = !isVisible
+        if !isVisible, ownsFirstResponder {
+            _ = window?.makeFirstResponder(nil)
+        }
+    }
+}
+
+@MainActor
+final class WorkspaceMonacoEditorBridge: NSObject, ObservableObject, WorkspaceMonacoWebViewLifecycle {
     private enum Constants {
         static let messageHandlerName = "devhavenMonacoEditor"
     }
 
     let webView: WKWebView
 
+    private var isActive = false
     private var isReady = false
     private var pendingPayload: WorkspaceMonacoEditorPayload?
     private var renderedPayload: WorkspaceMonacoEditorPayload?
@@ -82,9 +123,41 @@ final class WorkspaceMonacoEditorBridge: NSObject, ObservableObject, WKScriptMes
         self.webView = webView
 
         super.init()
+    }
 
-        contentController.add(self, name: Constants.messageHandlerName)
+    func activate() {
+        guard !isActive else {
+            return
+        }
+        isActive = true
+        isReady = false
+        renderedPayload = nil
+
+        let messageHandler = WorkspaceMonacoEditorScriptMessageHandler(bridge: self)
+        webView.configuration.userContentController.add(
+            messageHandler,
+            name: Constants.messageHandlerName
+        )
         loadShellIfNeeded()
+    }
+
+    func tearDown() {
+        guard isActive else {
+            return
+        }
+        isActive = false
+        isReady = false
+        webView.configuration.userContentController.removeScriptMessageHandler(
+            forName: Constants.messageHandlerName
+        )
+        webView.stopLoading()
+        webView.navigationDelegate = nil
+        webView.uiDelegate = nil
+        pendingPayload = nil
+        renderedPayload = nil
+        pendingScripts.removeAll(keepingCapacity: false)
+        onContentChanged = nil
+        onSaveRequested = nil
     }
 
     func update(
@@ -92,6 +165,7 @@ final class WorkspaceMonacoEditorBridge: NSObject, ObservableObject, WKScriptMes
         onContentChanged: @escaping (String) -> Void,
         onSaveRequested: @escaping () -> Void
     ) {
+        activate()
         self.onContentChanged = onContentChanged
         self.onSaveRequested = onSaveRequested
         pendingPayload = payload
@@ -173,6 +247,7 @@ final class WorkspaceMonacoEditorBridge: NSObject, ObservableObject, WKScriptMes
     }
 
     private func evaluateWhenReady(script: String) {
+        activate()
         guard isReady else {
             pendingScripts.append(script)
             return
@@ -197,7 +272,10 @@ final class WorkspaceMonacoEditorBridge: NSObject, ObservableObject, WKScriptMes
         return String(data: data, encoding: .utf8)
     }
 
-    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+    fileprivate func handleScriptMessage(_ message: WKScriptMessage) {
+        guard isActive else {
+            return
+        }
         guard message.name == Constants.messageHandlerName,
               let body = message.body as? [String: Any],
               let type = body["type"] as? String
@@ -223,6 +301,70 @@ final class WorkspaceMonacoEditorBridge: NSObject, ObservableObject, WKScriptMes
     }
 }
 
+struct WorkspaceMonacoWebViewHost<Bridge: WorkspaceMonacoWebViewLifecycle>: NSViewRepresentable {
+    let bridge: Bridge
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(bridge: bridge)
+    }
+
+    func makeNSView(context: Context) -> WorkspaceEmbeddedWebViewContainer.ContainerView {
+        let containerView = WorkspaceEmbeddedWebViewContainer.ContainerView()
+        context.coordinator.host(
+            bridge,
+            in: containerView,
+            isVisible: context.environment.workspaceRetainedTabIsVisible
+        )
+        return containerView
+    }
+
+    func updateNSView(
+        _ nsView: WorkspaceEmbeddedWebViewContainer.ContainerView,
+        context: Context
+    ) {
+        context.coordinator.host(
+            bridge,
+            in: nsView,
+            isVisible: context.environment.workspaceRetainedTabIsVisible
+        )
+    }
+
+    static func dismantleNSView(
+        _ nsView: WorkspaceEmbeddedWebViewContainer.ContainerView,
+        coordinator: Coordinator
+    ) {
+        coordinator.tearDown()
+    }
+
+    @MainActor
+    final class Coordinator {
+        private var bridge: Bridge
+
+        init(bridge: Bridge) {
+            self.bridge = bridge
+        }
+
+        func host(
+            _ nextBridge: Bridge,
+            in containerView: WorkspaceEmbeddedWebViewContainer.ContainerView,
+            isVisible: Bool
+        ) {
+            if bridge !== nextBridge {
+                tearDown()
+                bridge = nextBridge
+            }
+            bridge.activate()
+            containerView.host(bridge.webView)
+            bridge.setHostVisibility(isVisible)
+        }
+
+        func tearDown() {
+            bridge.webView.removeFromSuperview()
+            bridge.tearDown()
+        }
+    }
+}
+
 struct WorkspaceMonacoEditorView: View {
     let filePath: String
     @Binding var text: String
@@ -237,7 +379,7 @@ struct WorkspaceMonacoEditorView: View {
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        WorkspaceEmbeddedWebViewContainer(webView: bridge.webView)
+        WorkspaceMonacoWebViewHost(bridge: bridge)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(NativeTheme.window)
             .onAppear {

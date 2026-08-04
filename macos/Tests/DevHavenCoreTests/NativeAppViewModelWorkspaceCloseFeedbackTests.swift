@@ -120,4 +120,70 @@ import XCTest
         XCTAssertEqual(viewModel.workspaceToastMessage, "已关闭项目「DevHaven」")
         viewModel.dismissWorkspaceToast()
     }
+
+    func testWorkspaceProjectCloseAffectedPathsIncludesOwnedWorktreeSessions() {
+        let rootProjectPath = "/tmp/project"
+        let worktreePath = "/tmp/project-worktree"
+        let unrelatedPath = "/tmp/unrelated"
+        let viewModel = NativeAppViewModel()
+        viewModel.openWorkspaceSessions = [
+            OpenWorkspaceSessionState(
+                projectPath: rootProjectPath,
+                controller: GhosttyWorkspaceController(projectPath: rootProjectPath)
+            ),
+            OpenWorkspaceSessionState(
+                projectPath: worktreePath,
+                rootProjectPath: rootProjectPath,
+                controller: GhosttyWorkspaceController(projectPath: worktreePath)
+            ),
+            OpenWorkspaceSessionState(
+                projectPath: unrelatedPath,
+                controller: GhosttyWorkspaceController(projectPath: unrelatedPath)
+            )
+        ]
+
+        XCTAssertEqual(
+            viewModel.workspaceProjectCloseAffectedPaths(rootProjectPath),
+            [rootProjectPath, worktreePath]
+        )
+    }
+
+    func testWorkspaceProjectCloseAffectedPathsForWorktreeOnlyIncludesThatSession() {
+        let rootProjectPath = "/tmp/project"
+        let worktreePath = "/tmp/project-worktree"
+        let viewModel = NativeAppViewModel()
+        viewModel.openWorkspaceSessions = [
+            OpenWorkspaceSessionState(
+                projectPath: rootProjectPath,
+                controller: GhosttyWorkspaceController(projectPath: rootProjectPath)
+            ),
+            OpenWorkspaceSessionState(
+                projectPath: worktreePath,
+                rootProjectPath: rootProjectPath,
+                controller: GhosttyWorkspaceController(projectPath: worktreePath)
+            )
+        ]
+
+        XCTAssertEqual(
+            viewModel.workspaceProjectCloseAffectedPaths(worktreePath),
+            [worktreePath]
+        )
+    }
+
+    func testWorkspaceProjectCloseAffectedPathsIncludesQuickTerminalSession() {
+        let quickTerminalPath = FileManager.default.homeDirectoryForCurrentUser.path
+        let viewModel = NativeAppViewModel()
+        viewModel.openWorkspaceSessions = [
+            OpenWorkspaceSessionState(
+                projectPath: quickTerminalPath,
+                controller: GhosttyWorkspaceController(projectPath: quickTerminalPath),
+                isQuickTerminal: true
+            )
+        ]
+
+        XCTAssertEqual(
+            viewModel.workspaceProjectCloseAffectedPaths(quickTerminalPath),
+            [quickTerminalPath]
+        )
+    }
 }

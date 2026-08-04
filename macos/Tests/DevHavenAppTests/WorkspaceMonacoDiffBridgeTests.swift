@@ -1,9 +1,83 @@
 import XCTest
+import WebKit
 @testable import DevHavenApp
 @testable import DevHavenCore
 
 @MainActor
 final class WorkspaceMonacoDiffBridgeTests: XCTestCase {
+    func testVisibilityTogglePreservesLoadedDiffDocument() async throws {
+        let bridge = WorkspaceMonacoDiffBridge()
+        let payload = makePayload(originalText: "before\n", modifiedText: "after\n")
+        installBridge(bridge, payload: payload)
+        let initialSnapshot = try await waitForSnapshot(on: bridge) { snapshot in
+            snapshot.hasEditor && snapshot.modelBindingCount == 1
+        }
+        try await bridge.webView.evaluateJavaScript("window.__devHavenRetentionToken = 'diff-state';")
+
+        bridge.setHostVisibility(false)
+        bridge.setHostVisibility(true)
+
+        let snapshot = try await waitForSnapshot(on: bridge)
+        let retentionToken = try await bridge.webView.evaluateJavaScript(
+            "window.__devHavenRetentionToken"
+        ) as? String
+        XCTAssertEqual(snapshot.originalText, payload.originalText)
+        XCTAssertEqual(snapshot.modifiedText, payload.modifiedText)
+        XCTAssertEqual(snapshot.modelBindingCount, initialSnapshot.modelBindingCount)
+        XCTAssertEqual(retentionToken, "diff-state")
+        bridge.tearDown()
+    }
+
+    func testTearDownReleasesBridgeAndWebView() {
+        weak var weakBridge: WorkspaceMonacoDiffBridge?
+        weak var weakWebView: WKWebView?
+
+        autoreleasepool {
+            let owner = BridgeOwner()
+            let bridge = WorkspaceMonacoDiffBridge()
+            owner.bridge = bridge
+            bridge.update(
+                payload: makePayload(),
+                selectedBlockID: nil,
+                onContentChanged: { [owner] _ in
+                    _ = owner.bridge
+                },
+                onSaveRequested: {},
+                onActiveBlockChanged: { _ in },
+                onPreviousDifferenceRequested: {},
+                onNextDifferenceRequested: {},
+                onRefreshRequested: {},
+                onViewerModeChanged: { _ in }
+            )
+            weakBridge = bridge
+            weakWebView = bridge.webView
+
+            bridge.tearDown()
+        }
+
+        XCTAssertNil(weakBridge)
+        XCTAssertNil(weakWebView)
+    }
+
+    func testBridgeReloadsAfterTearDown() async throws {
+        let bridge = WorkspaceMonacoDiffBridge()
+        installBridge(
+            bridge,
+            payload: makePayload(originalText: "before\n", modifiedText: "first\n")
+        )
+        _ = try await waitForSnapshot(on: bridge) { $0.modifiedText == "first\n" }
+
+        bridge.tearDown()
+        installBridge(
+            bridge,
+            payload: makePayload(originalText: "before\n", modifiedText: "second\n")
+        )
+
+        let snapshot = try await waitForSnapshot(on: bridge) { $0.modifiedText == "second\n" }
+        XCTAssertEqual(snapshot.modifiedText, "second\n")
+        bridge.tearDown()
+    }
+
     func testBridgeLoadsLocalMonacoAndAppliesInitialPayload() async throws {
         let bridge = WorkspaceMonacoDiffBridge()
         let payload = makePayload(
@@ -353,6 +427,10 @@ final class WorkspaceMonacoDiffBridgeTests: XCTestCase {
             modelBindingCount: rawSnapshot["modelBindingCount"] as? Int ?? 0,
             hideUnchangedRegionsEnabled: rawSnapshot["hideUnchangedRegionsEnabled"] as? Bool ?? false
         )
+    }
+
+    private final class BridgeOwner {
+        var bridge: WorkspaceMonacoDiffBridge?
     }
 }
 

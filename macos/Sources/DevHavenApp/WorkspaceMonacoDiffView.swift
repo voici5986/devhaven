@@ -44,13 +44,27 @@ struct WorkspaceMonacoDiffPayload: Codable, Equatable {
 }
 
 @MainActor
-final class WorkspaceMonacoDiffBridge: NSObject, ObservableObject, WKScriptMessageHandler {
+private final class WorkspaceMonacoDiffScriptMessageHandler: NSObject, WKScriptMessageHandler {
+    weak var bridge: WorkspaceMonacoDiffBridge?
+
+    init(bridge: WorkspaceMonacoDiffBridge) {
+        self.bridge = bridge
+    }
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        bridge?.handleScriptMessage(message)
+    }
+}
+
+@MainActor
+final class WorkspaceMonacoDiffBridge: NSObject, ObservableObject, WorkspaceMonacoWebViewLifecycle {
     private enum Constants {
         static let messageHandlerName = "devhavenMonacoDiff"
     }
 
     let webView: WKWebView
 
+    private var isActive = false
     private var isReady = false
     private var pendingPayload: WorkspaceMonacoDiffPayload?
     private var renderedPayload: WorkspaceMonacoDiffPayload?
@@ -79,9 +93,48 @@ final class WorkspaceMonacoDiffBridge: NSObject, ObservableObject, WKScriptMessa
         self.webView = webView
 
         super.init()
+    }
 
-        contentController.add(self, name: Constants.messageHandlerName)
+    func activate() {
+        guard !isActive else {
+            return
+        }
+        isActive = true
+        isReady = false
+        renderedPayload = nil
+        renderedSelectedBlockID = nil
+
+        let messageHandler = WorkspaceMonacoDiffScriptMessageHandler(bridge: self)
+        webView.configuration.userContentController.add(
+            messageHandler,
+            name: Constants.messageHandlerName
+        )
         loadShellIfNeeded()
+    }
+
+    func tearDown() {
+        guard isActive else {
+            return
+        }
+        isActive = false
+        isReady = false
+        webView.configuration.userContentController.removeScriptMessageHandler(
+            forName: Constants.messageHandlerName
+        )
+        webView.stopLoading()
+        webView.navigationDelegate = nil
+        webView.uiDelegate = nil
+        pendingPayload = nil
+        renderedPayload = nil
+        pendingSelectedBlockID = nil
+        renderedSelectedBlockID = nil
+        onContentChanged = nil
+        onSaveRequested = nil
+        onActiveBlockChanged = nil
+        onPreviousDifferenceRequested = nil
+        onNextDifferenceRequested = nil
+        onRefreshRequested = nil
+        onViewerModeChanged = nil
     }
 
     func update(
@@ -95,6 +148,7 @@ final class WorkspaceMonacoDiffBridge: NSObject, ObservableObject, WKScriptMessa
         onRefreshRequested: @escaping () -> Void,
         onViewerModeChanged: @escaping (WorkspaceDiffViewerMode) -> Void
     ) {
+        activate()
         self.onContentChanged = onContentChanged
         self.onSaveRequested = onSaveRequested
         self.onActiveBlockChanged = onActiveBlockChanged
@@ -109,6 +163,7 @@ final class WorkspaceMonacoDiffBridge: NSObject, ObservableObject, WKScriptMessa
     }
 
     func focusModifiedEditor() {
+        activate()
         evaluate(script: "window.__devHavenMonaco?.focusModifiedEditor?.();")
     }
 
@@ -160,7 +215,10 @@ final class WorkspaceMonacoDiffBridge: NSObject, ObservableObject, WKScriptMessa
         return String(data: data, encoding: .utf8)
     }
 
-    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+    fileprivate func handleScriptMessage(_ message: WKScriptMessage) {
+        guard isActive else {
+            return
+        }
         guard message.name == Constants.messageHandlerName,
               let body = message.body as? [String: Any],
               let type = body["type"] as? String
@@ -215,7 +273,7 @@ struct WorkspaceMonacoDiffView: View {
     @StateObject private var bridge = WorkspaceMonacoDiffBridge()
 
     var body: some View {
-        WorkspaceEmbeddedWebViewContainer(webView: bridge.webView)
+        WorkspaceMonacoWebViewHost(bridge: bridge)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(NativeTheme.window)
             .onAppear {

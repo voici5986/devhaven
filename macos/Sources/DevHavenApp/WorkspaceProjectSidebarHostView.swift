@@ -328,23 +328,20 @@ struct WorkspaceProjectSidebarHostView: View {
     }
 
     private func requestCloseProject(_ projectPath: String) {
-        guard let session = viewModel.openWorkspaceSessions.first(where: { $0.projectPath == projectPath }) else {
+        let affectedProjectPaths = viewModel.workspaceProjectCloseAffectedPaths(projectPath)
+        guard !affectedProjectPaths.isEmpty else {
             viewModel.closeWorkspaceProject(projectPath)
             return
         }
 
-        let evaluators: [any WorkspaceTerminalCloseRequirementEvaluating] = session.controller.tabs.flatMap { tab in
-            tab.leaves.flatMap { pane in
-                pane.items.compactMap { item in
-                    guard item.isTerminal else {
-                        return nil
-                    }
-                    return terminalStoreRegistry.modelIfLoaded(
-                        for: projectPath,
-                        itemID: item.id
-                    ).map { $0 as any WorkspaceTerminalCloseRequirementEvaluating }
-                }
-            }
+        let evaluators = WorkspaceTerminalCloseCoordinator.evaluatorsForProjectClose(
+            sessions: viewModel.openWorkspaceSessions,
+            affectedProjectPaths: affectedProjectPaths
+        ) { projectPath, itemID in
+            terminalStoreRegistry.modelIfLoaded(
+                for: projectPath,
+                itemID: itemID
+            ).map { $0 as any WorkspaceTerminalCloseRequirementEvaluating }
         }
         WorkspaceTerminalCloseCoordinator.confirmIfNeeded(
             evaluators: evaluators,

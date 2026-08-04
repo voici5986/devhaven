@@ -7,6 +7,7 @@ struct WorkspaceRunConsolePanel: View {
     let onSelectSession: (String) -> Void
     let onClear: () -> Void
     let onOpenLog: () -> Void
+    let onCancelRestart: (String) -> Void
     let onHide: () -> Void
     @State private var isPinnedToBottom = true
     @State private var scrollViewportMaxY: CGFloat = .zero
@@ -137,9 +138,28 @@ struct WorkspaceRunConsolePanel: View {
 
     private var footer: some View {
         HStack(spacing: 12) {
-            Text(consoleState.selectedSession.map(statusText(for:)) ?? "未选择运行配置")
-                .font(.caption)
-                .foregroundStyle(NativeTheme.textSecondary)
+            Group {
+                if let pendingRestart = consoleState.pendingRestart(
+                    forSessionID: consoleState.selectedSession?.id
+                ) {
+                    Label(
+                        "\(pendingRestart.configurationName) · 正在停止，退出后重启",
+                        systemImage: "clock.arrow.circlepath"
+                    )
+                    Button {
+                        onCancelRestart(pendingRestart.configurationID)
+                    } label: {
+                        Image(systemName: "xmark.circle")
+                    }
+                    .buttonStyle(.plain)
+                    .help("取消等待重启")
+                    .accessibilityLabel("取消等待重启")
+                } else {
+                    Text(consoleState.selectedSession.map(statusText(for:)) ?? "未选择运行配置")
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(NativeTheme.textSecondary)
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 12)

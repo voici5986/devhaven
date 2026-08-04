@@ -6,11 +6,13 @@ struct WorkspaceRunToolbarView: View {
     let selectedConfigurationID: String?
     let canRun: Bool
     let canStop: Bool
+    let pendingRestart: WorkspaceRunPendingRestart?
     let hasSessions: Bool
     let isLogsVisible: Bool
     let onSelectConfiguration: (String) -> Void
     let onRun: () -> Void
     let onStop: () -> Void
+    let onCancelRestart: () -> Void
     let onToggleLogs: () -> Void
     let onConfigure: () -> Void
 
@@ -47,18 +49,36 @@ struct WorkspaceRunToolbarView: View {
             }
             .menuStyle(.borderlessButton)
 
-            Button("Run") {
-                onRun()
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(NativeTheme.accent)
-            .disabled(!canRun)
+            if let pendingRestart {
+                Button {} label: {
+                    Label("等待重启", systemImage: "clock.arrow.circlepath")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(true)
+                .help("正在停止“\(pendingRestart.configurationName)”，进程退出后将自动重启")
 
-            Button("Stop") {
-                onStop()
+                Button {
+                    onCancelRestart()
+                } label: {
+                    Image(systemName: "xmark.circle")
+                }
+                .buttonStyle(.bordered)
+                .help("取消等待重启")
+                .accessibilityLabel("取消等待重启")
+            } else {
+                Button("Run") {
+                    onRun()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(NativeTheme.accent)
+                .disabled(!canRun)
+
+                Button("Stop") {
+                    onStop()
+                }
+                .buttonStyle(.bordered)
+                .disabled(!canStop)
             }
-            .buttonStyle(.bordered)
-            .disabled(!canStop)
 
             Button("Logs") {
                 onToggleLogs()

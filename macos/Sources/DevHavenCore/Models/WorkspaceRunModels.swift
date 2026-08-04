@@ -216,12 +216,31 @@ public struct WorkspaceRunSession: Identifiable, Equatable, Sendable {
     }
 }
 
+public struct WorkspaceRunPendingRestart: Identifiable, Equatable, Sendable {
+    public var stoppedSessionID: String
+    public var configurationID: String
+    public var configurationName: String
+
+    public var id: String { stoppedSessionID }
+
+    public init(
+        stoppedSessionID: String,
+        configurationID: String,
+        configurationName: String
+    ) {
+        self.stoppedSessionID = stoppedSessionID
+        self.configurationID = configurationID
+        self.configurationName = configurationName
+    }
+}
+
 public struct WorkspaceRunConsoleState: Equatable, Sendable {
     public static let defaultPanelHeight: Double = 220
 
     public var sessions: [WorkspaceRunSession]
     public var selectedSessionID: String?
     public var selectedConfigurationID: String?
+    public var pendingRestarts: [WorkspaceRunPendingRestart]
     public var isVisible: Bool
     public var panelHeight: Double
 
@@ -229,12 +248,14 @@ public struct WorkspaceRunConsoleState: Equatable, Sendable {
         sessions: [WorkspaceRunSession] = [],
         selectedSessionID: String? = nil,
         selectedConfigurationID: String? = nil,
+        pendingRestarts: [WorkspaceRunPendingRestart] = [],
         isVisible: Bool = false,
         panelHeight: Double = WorkspaceRunConsoleState.defaultPanelHeight
     ) {
         self.sessions = sessions
         self.selectedSessionID = selectedSessionID
         self.selectedConfigurationID = selectedConfigurationID
+        self.pendingRestarts = pendingRestarts
         self.isVisible = isVisible
         self.panelHeight = panelHeight
     }
@@ -254,6 +275,20 @@ public struct WorkspaceRunConsoleState: Equatable, Sendable {
             }
         }
     }
+
+    public func pendingRestart(forConfigurationID configurationID: String?) -> WorkspaceRunPendingRestart? {
+        guard let configurationID else {
+            return nil
+        }
+        return pendingRestarts.first(where: { $0.configurationID == configurationID })
+    }
+
+    public func pendingRestart(forSessionID sessionID: String?) -> WorkspaceRunPendingRestart? {
+        guard let sessionID else {
+            return nil
+        }
+        return pendingRestarts.first(where: { $0.stoppedSessionID == sessionID })
+    }
 }
 
 public struct WorkspaceRunToolbarState: Equatable, Sendable {
@@ -261,6 +296,7 @@ public struct WorkspaceRunToolbarState: Equatable, Sendable {
     public var selectedConfigurationID: String?
     public var canRun: Bool
     public var canStop: Bool
+    public var pendingRestart: WorkspaceRunPendingRestart?
     public var hasSessions: Bool
     public var isLogsVisible: Bool
 
@@ -269,6 +305,7 @@ public struct WorkspaceRunToolbarState: Equatable, Sendable {
         selectedConfigurationID: String? = nil,
         canRun: Bool = false,
         canStop: Bool = false,
+        pendingRestart: WorkspaceRunPendingRestart? = nil,
         hasSessions: Bool = false,
         isLogsVisible: Bool = false
     ) {
@@ -276,6 +313,7 @@ public struct WorkspaceRunToolbarState: Equatable, Sendable {
         self.selectedConfigurationID = selectedConfigurationID
         self.canRun = canRun
         self.canStop = canStop
+        self.pendingRestart = pendingRestart
         self.hasSessions = hasSessions
         self.isLogsVisible = isLogsVisible
     }

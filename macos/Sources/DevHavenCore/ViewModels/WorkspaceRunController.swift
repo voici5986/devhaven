@@ -12,6 +12,7 @@ final class WorkspaceRunController {
     private let reportError: @MainActor (String?) -> Void
 
     private var consoleStateByProjectPath: [String: WorkspaceRunConsoleState] = [:]
+    private var pendingRestartByStoppedSessionID: [String: WorkspaceRunStartRequest] = [:]
 
     init(
         runManager: any WorkspaceRunManaging,
@@ -73,12 +74,16 @@ final class WorkspaceRunController {
         let configurations = availableConfigurations(resolvedProjectPath)
         let consoleState = consoleStateByProjectPath[resolvedProjectPath] ?? WorkspaceRunConsoleState()
         let selectedConfiguration = selectedConfiguration(in: resolvedProjectPath)
+        let pendingRestart = consoleState.pendingRestart(
+            forConfigurationID: selectedConfiguration?.id
+        )
 
         return WorkspaceRunToolbarState(
             configurations: configurations,
             selectedConfigurationID: consoleState.selectedConfigurationID ?? selectedConfiguration?.id,
-            canRun: selectedConfiguration?.canRun ?? false,
-            canStop: consoleState.selectedSession?.state.isActive ?? false,
+            canRun: (selectedConfiguration?.canRun ?? false) && pendingRestart == nil,
+            canStop: (consoleState.selectedSession?.state.isActive ?? false) && pendingRestart == nil,
+            pendingRestart: pendingRestart,
             hasSessions: !consoleState.sessions.isEmpty,
             isLogsVisible: consoleState.isVisible
         )
@@ -114,86 +119,111 @@ final class WorkspaceRunController {
             throw error
         }
 
-        var state = consoleStateByProjectPath[resolvedProjectPath] ?? WorkspaceRunConsoleState()
-        if let existingSession = state.sessions.first(where: { $0.configurationID == configuration.id }),
-           existingSession.state.isActive {
-            runManager.stop(sessionID: existingSession.id)
-        }
-
-        let sessionID = UUID().uuidString
-        let placeholderSession = WorkspaceRunSession(
-            id: sessionID,
+        let request = WorkspaceRunStartRequest(
+            sessionID: UUID().uuidString,
             configurationID: configuration.id,
             configurationName: configuration.name,
             configurationSource: configuration.source,
             projectPath: resolvedProjectPath,
             rootProjectPath: session.rootProjectPath,
-            command: configuration.displayCommand,
-            workingDirectory: configuration.workingDirectory,
+            executable: configuration.executable,
+            displayCommand: configuration.displayCommand,
+            workingDirectory: configuration.workingDirectory
+        )
+
+        let state = consoleStateByProjectPath[resolvedProjectPath] ?? WorkspaceRunConsoleState()
+        if let existingSession = state.sessions.first(where: { $0.configurationID == configuration.id }),
+           existingSession.state.isActive {
+            guard pendingRestartByStoppedSessionID[existingSession.id] == nil else {
+                return
+            }
+            pendingRestartByStoppedSessionID[existingSession.id] = request
+            var pendingState = state
+            pendingState.pendingRestarts.removeAll {
+                $0.stoppedSessionID == existingSession.id || $0.configurationID == configuration.id
+            }
+            pendingState.pendingRestarts.append(
+                WorkspaceRunPendingRestart(
+                    stoppedSessionID: existingSession.id,
+                    configurationID: configuration.id,
+                    configurationName: configuration.name
+                )
+            )
+            pendingState.selectedSessionID = existingSession.id
+            pendingState.selectedConfigurationID = configuration.id
+            consoleStateByProjectPath[resolvedProjectPath] = pendingState
+            runManager.stop(sessionID: existingSession.id)
+            return
+        }
+
+        try startRun(request)
+    }
+
+    private func startRun(_ request: WorkspaceRunStartRequest) throws {
+        var state = consoleStateByProjectPath[request.projectPath] ?? WorkspaceRunConsoleState()
+        let placeholderSession = WorkspaceRunSession(
+            id: request.sessionID,
+            configurationID: request.configurationID,
+            configurationName: request.configurationName,
+            configurationSource: request.configurationSource,
+            projectPath: request.projectPath,
+            rootProjectPath: request.rootProjectPath,
+            command: request.displayCommand,
+            workingDirectory: request.workingDirectory,
             state: .starting,
             startedAt: Date()
         )
-        if let existingIndex = state.sessions.firstIndex(where: { $0.configurationID == configuration.id }) {
+        if let existingIndex = state.sessions.firstIndex(where: { $0.configurationID == request.configurationID }) {
             state.sessions[existingIndex] = placeholderSession
         } else {
             state.sessions.append(placeholderSession)
         }
-        state.selectedSessionID = sessionID
-        state.selectedConfigurationID = configuration.id
+        state.selectedSessionID = request.sessionID
+        state.selectedConfigurationID = request.configurationID
         state.isVisible = true
-        consoleStateByProjectPath[resolvedProjectPath] = state
+        consoleStateByProjectPath[request.projectPath] = state
 
         do {
-            let runSession = try runManager.start(
-                WorkspaceRunStartRequest(
-                    sessionID: sessionID,
-                    configurationID: configuration.id,
-                    configurationName: configuration.name,
-                    configurationSource: configuration.source,
-                    projectPath: resolvedProjectPath,
-                    rootProjectPath: session.rootProjectPath,
-                    executable: configuration.executable,
-                    displayCommand: configuration.displayCommand,
-                    workingDirectory: configuration.workingDirectory
-                )
-            )
-            var currentState = consoleStateByProjectPath[resolvedProjectPath] ?? state
-            if let index = currentState.sessions.firstIndex(where: { $0.id == sessionID }) {
+            let runSession = try runManager.start(request)
+            var currentState = consoleStateByProjectPath[request.projectPath] ?? state
+            if let index = currentState.sessions.firstIndex(where: { $0.id == request.sessionID }) {
                 var updatedSession = runSession
                 updatedSession.startedAt = currentState.sessions[index].startedAt
                 updatedSession.displayBuffer = currentState.sessions[index].displayBuffer
                 currentState.sessions[index] = updatedSession
-            } else if let index = currentState.sessions.firstIndex(where: { $0.configurationID == configuration.id }) {
+            } else if let index = currentState.sessions.firstIndex(where: { $0.configurationID == request.configurationID }) {
                 currentState.sessions[index] = runSession
             } else {
                 currentState.sessions.append(runSession)
             }
-            consoleStateByProjectPath[resolvedProjectPath] = currentState
+            consoleStateByProjectPath[request.projectPath] = currentState
             reportError(nil)
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             let failureBuffer = "启动失败：\(message)\n"
-            var currentState = consoleStateByProjectPath[resolvedProjectPath] ?? state
+            var currentState = consoleStateByProjectPath[request.projectPath] ?? state
             let failureSession = WorkspaceRunSession(
-                id: sessionID,
-                configurationID: configuration.id,
-                configurationName: configuration.name,
-                configurationSource: configuration.source,
-                projectPath: resolvedProjectPath,
-                rootProjectPath: session.rootProjectPath,
-                command: configuration.command,
-                workingDirectory: configuration.workingDirectory,
+                id: request.sessionID,
+                configurationID: request.configurationID,
+                configurationName: request.configurationName,
+                configurationSource: request.configurationSource,
+                projectPath: request.projectPath,
+                rootProjectPath: request.rootProjectPath,
+                command: request.displayCommand,
+                workingDirectory: request.workingDirectory,
                 state: .failed(exitCode: -1),
-                startedAt: currentState.sessions.first(where: { $0.id == sessionID })?.startedAt ?? Date(),
+                startedAt: currentState.sessions.first(where: { $0.id == request.sessionID })?.startedAt ?? Date(),
                 endedAt: Date(),
                 displayBuffer: failureBuffer
             )
-            if let index = currentState.sessions.firstIndex(where: { $0.id == sessionID || $0.configurationID == configuration.id }) {
+            if let index = currentState.sessions.firstIndex(where: {
+                $0.id == request.sessionID || $0.configurationID == request.configurationID
+            }) {
                 currentState.sessions[index] = failureSession
             } else {
                 currentState.sessions.append(failureSession)
             }
-            consoleStateByProjectPath[resolvedProjectPath] = currentState
+            consoleStateByProjectPath[request.projectPath] = currentState
             reportError(message)
             throw error
         }
@@ -219,7 +249,30 @@ final class WorkspaceRunController {
         else {
             return
         }
+        guard pendingRestartByStoppedSessionID[sessionID] == nil else {
+            return
+        }
         runManager.stop(sessionID: sessionID)
+    }
+
+    func cancelPendingRestart(
+        configurationID: String? = nil,
+        in projectPath: String? = nil
+    ) {
+        guard let resolvedProjectPath = resolveProjectPath(projectPath),
+              var state = consoleStateByProjectPath[resolvedProjectPath]
+        else {
+            return
+        }
+        let targetConfigurationID = configurationID ?? state.selectedConfigurationID
+        guard let pendingRestart = state.pendingRestart(
+            forConfigurationID: targetConfigurationID
+        ) else {
+            return
+        }
+        pendingRestartByStoppedSessionID.removeValue(forKey: pendingRestart.stoppedSessionID)
+        state.pendingRestarts.removeAll { $0.id == pendingRestart.id }
+        consoleStateByProjectPath[resolvedProjectPath] = state
     }
 
     func toggleConsole(in projectPath: String? = nil) {
@@ -274,6 +327,9 @@ final class WorkspaceRunController {
     func retainConsoleState(for openProjectPaths: [String]) {
         let openPathSet = Set(openProjectPaths.map(normalizePath))
         consoleStateByProjectPath = consoleStateByProjectPath.filter { openPathSet.contains($0.key) }
+        pendingRestartByStoppedSessionID = pendingRestartByStoppedSessionID.filter {
+            openPathSet.contains(normalizePath($0.value.projectPath))
+        }
     }
 
     private func resolveProjectPath(_ projectPath: String?) -> String? {
@@ -305,6 +361,24 @@ final class WorkspaceRunController {
                 if !runState.isActive {
                     state.sessions[index].endedAt = Date()
                 }
+            }
+            guard !runState.isActive,
+                  let restartRequest = pendingRestartByStoppedSessionID.removeValue(forKey: sessionID)
+            else {
+                return
+            }
+            updateConsoleState(for: projectPath) { state in
+                state.pendingRestarts.removeAll { $0.stoppedSessionID == sessionID }
+            }
+            guard openProjectPaths().map(normalizePath).contains(normalizePath(restartRequest.projectPath)),
+                  workspaceSession(normalizePath(restartRequest.projectPath)) != nil
+            else {
+                return
+            }
+            do {
+                try startRun(restartRequest)
+            } catch {
+                // startRun 已经把失败会话和错误信息写回状态。
             }
         }
     }

@@ -33,6 +33,16 @@ extension NativeAppViewModel {
         workspaceRunController.stopSelectedSession(in: projectPath)
     }
 
+    public func cancelPendingWorkspaceRunRestart(
+        configurationID: String? = nil,
+        in projectPath: String? = nil
+    ) {
+        workspaceRunController.cancelPendingRestart(
+            configurationID: configurationID,
+            in: projectPath
+        )
+    }
+
     public func toggleWorkspaceRunConsole(in projectPath: String? = nil) {
         workspaceRunController.toggleConsole(in: projectPath)
     }

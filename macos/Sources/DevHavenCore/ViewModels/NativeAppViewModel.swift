@@ -1592,75 +1592,55 @@ public final class NativeAppViewModel {
         scheduleWorkspaceRestoreAutosave()
     }
 
-    public func closeWorkspaceProject(_ path: String) {
+    public func workspaceProjectCloseAffectedPaths(_ path: String) -> [String] {
         let normalizedPath = normalizePathForCompare(path)
 
         guard let index = workspaceSessionIndex(for: path) else {
-            let groupedSessionIndices = openWorkspaceSessions.enumerated().compactMap { element -> Int? in
-                let session = element.element
+            return openWorkspaceSessions.compactMap { session -> String? in
                 guard !session.isQuickTerminal,
                       normalizePathForCompare(session.rootProjectPath) == normalizedPath
                 else {
                     return nil
                 }
-                return element.offset
+                return session.projectPath
             }
-            guard !groupedSessionIndices.isEmpty else {
-                return
-            }
-
-            let removedPaths = Set(groupedSessionIndices.map { openWorkspaceSessions[$0].projectPath })
-            let fallbackAnchorIndex = groupedSessionIndices.min() ?? 0
-
-            openWorkspaceSessions.removeAll { removedPaths.contains($0.projectPath) }
-            removedPaths.forEach { runManager.stopAll(projectPath: $0) }
-            clearWorkspaceRuntimePresentationState(for: removedPaths)
-            workspaceRunController.retainConsoleState(for: openWorkspaceProjectPaths)
-            syncAttentionStateWithOpenSessions()
-
-            if openWorkspaceSessions.isEmpty {
-                activeWorkspaceProjectPath = nil
-                isDetailPanelPresented = false
-                scheduleWorkspaceRestoreAutosave()
-                return
-            }
-
-            if let currentActiveWorkspaceProjectPath = activeWorkspaceProjectPath,
-               removedPaths.contains(currentActiveWorkspaceProjectPath) {
-                let fallbackIndex = min(fallbackAnchorIndex, openWorkspaceSessions.count - 1)
-                let fallbackPath = openWorkspaceSessions[fallbackIndex].projectPath
-                activeWorkspaceProjectPath = fallbackPath
-                selectedProjectPath = fallbackPath
-                isDetailPanelPresented = false
-                scheduleSelectedProjectDocumentRefresh()
-            }
-            scheduleWorkspaceRestoreAutosave()
-            return
         }
 
         let session = openWorkspaceSessions[index]
         let rootProjectPath = session.rootProjectPath
         let workspaceAlignmentGroupID = session.workspaceRootContext?.workspaceID
-        let removedPaths: Set<String>
         let shouldCascadeOwnedSessions = normalizePathForCompare(rootProjectPath) == normalizedPath &&
             (session.workspaceAlignmentGroupID == nil || workspaceAlignmentGroupID != nil)
         if shouldCascadeOwnedSessions {
-            removedPaths = Set(
-                openWorkspaceSessions
-                    .filter {
-                        let sessionPathMatches = normalizePathForCompare($0.projectPath) == normalizedPath
-                        if let workspaceAlignmentGroupID {
-                            return sessionPathMatches || $0.workspaceAlignmentGroupID == workspaceAlignmentGroupID
-                        }
-                        return sessionPathMatches || isWorkspaceSessionOwnedByProjectPool($0, rootProjectPath: path)
+            return openWorkspaceSessions.compactMap { candidate -> String? in
+                let sessionPathMatches = normalizePathForCompare(candidate.projectPath) == normalizedPath
+                if let workspaceAlignmentGroupID {
+                    guard sessionPathMatches || candidate.workspaceAlignmentGroupID == workspaceAlignmentGroupID else {
+                        return nil
                     }
-                    .map(\.projectPath)
-            )
-            openWorkspaceSessions.removeAll { removedPaths.contains($0.projectPath) }
-        } else {
-            removedPaths = Set([path])
-            openWorkspaceSessions.remove(at: index)
+                    return candidate.projectPath
+                }
+                guard sessionPathMatches || isWorkspaceSessionOwnedByProjectPool(candidate, rootProjectPath: path) else {
+                    return nil
+                }
+                return candidate.projectPath
+            }
         }
+        return [session.projectPath]
+    }
+
+    public func closeWorkspaceProject(_ path: String) {
+        let affectedPaths = workspaceProjectCloseAffectedPaths(path)
+        guard !affectedPaths.isEmpty else {
+            return
+        }
+
+        let removedPaths = Set(affectedPaths)
+        let fallbackAnchorIndex = openWorkspaceSessions.enumerated().compactMap { element in
+            removedPaths.contains(element.element.projectPath) ? element.offset : nil
+        }.min() ?? 0
+
+        openWorkspaceSessions.removeAll { removedPaths.contains($0.projectPath) }
         removedPaths.forEach { runManager.stopAll(projectPath: $0) }
         clearWorkspaceRuntimePresentationState(for: removedPaths)
         workspaceRunController.retainConsoleState(for: openWorkspaceProjectPaths)
@@ -1673,8 +1653,9 @@ public final class NativeAppViewModel {
             return
         }
 
-        if let currentActiveWorkspaceProjectPath = activeWorkspaceProjectPath, removedPaths.contains(currentActiveWorkspaceProjectPath) {
-            let fallbackIndex = min(index, openWorkspaceSessions.count - 1)
+        if let currentActiveWorkspaceProjectPath = activeWorkspaceProjectPath,
+           removedPaths.contains(currentActiveWorkspaceProjectPath) {
+            let fallbackIndex = min(fallbackAnchorIndex, openWorkspaceSessions.count - 1)
             let fallbackPath = openWorkspaceSessions[fallbackIndex].projectPath
             activeWorkspaceProjectPath = fallbackPath
             selectedProjectPath = fallbackPath
@@ -4769,6 +4750,7 @@ public final class NativeAppViewModel {
     private func clearWorkspaceRuntimePresentationState(for paths: Set<String>) {
         for path in paths {
             workspaceEditorRuntimeCoordinator.removeProjectState(path)
+            workspaceProjectTreeController.cancelDirectoryLoads(for: path)
             workspaceProjectTreeRefreshTasksByProjectPath[path]?.cancel()
             workspaceProjectTreeRefreshTasksByProjectPath[path] = nil
             workspaceProjectTreeRefreshGenerationByProjectPath[path] = nil

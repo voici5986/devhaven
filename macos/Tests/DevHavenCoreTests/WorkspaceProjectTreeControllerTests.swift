@@ -84,14 +84,212 @@ final class WorkspaceProjectTreeControllerTests: XCTestCase {
     }
 
     @MainActor
+    func testCollapsedDirectoryRejectsLateResultFromSupersededLoad() async throws {
+        try createDirectory("Sources")
+        let normalizedProjectPath = normalizeTestPath(projectURL.path)
+        let sourcesPath = normalizeTestPath(projectURL.appendingPathComponent("Sources", isDirectory: true).path)
+        let stalePath = normalizeTestPath(projectURL.appendingPathComponent("Sources/Stale.swift").path)
+        let freshPath = normalizeTestPath(projectURL.appendingPathComponent("Sources/Fresh.swift").path)
+        let sourcesNode = WorkspaceProjectTreeNode(
+            path: sourcesPath,
+            parentPath: normalizedProjectPath,
+            name: "Sources",
+            kind: .directory,
+            isHidden: false
+        )
+        let store = WorkspaceProjectTreeStateStore(
+            statesByProjectPath: [
+                normalizedProjectPath: WorkspaceProjectTreeState(
+                    rootProjectPath: normalizedProjectPath,
+                    rootNodes: [sourcesNode],
+                    childrenByDirectoryPath: [normalizedProjectPath: [sourcesNode]]
+                )
+            ]
+        )
+        let loader = ControlledDirectoryLoader(
+            staleResult: [
+                WorkspaceProjectTreeNode(
+                    path: stalePath,
+                    parentPath: sourcesPath,
+                    name: "Stale.swift",
+                    kind: .file,
+                    isHidden: false
+                )
+            ],
+            freshResult: [
+                WorkspaceProjectTreeNode(
+                    path: freshPath,
+                    parentPath: sourcesPath,
+                    name: "Fresh.swift",
+                    kind: .file,
+                    isHidden: false
+                )
+            ]
+        )
+        let controller = makeController(
+            store: store,
+            normalizedProjectPath: normalizedProjectPath,
+            listDirectory: { path in try loader.load(path) }
+        )
+
+        controller.toggleDirectory(sourcesPath, in: normalizedProjectPath)
+        let staleLoadStarted = await waitUntil(timeout: 1) { loader.callCount == 1 }
+        XCTAssertTrue(staleLoadStarted)
+
+        controller.toggleDirectory(sourcesPath, in: normalizedProjectPath)
+        controller.toggleDirectory(sourcesPath, in: normalizedProjectPath)
+
+        let freshLoadFinished = await waitUntil(timeout: 1) {
+            store.statesByProjectPath[normalizedProjectPath]?
+                .childrenByDirectoryPath[sourcesPath]?
+                .map(\.name) == ["Fresh.swift"]
+        }
+        XCTAssertTrue(freshLoadFinished)
+
+        loader.releaseStaleLoad()
+        try? await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertEqual(
+            store.statesByProjectPath[normalizedProjectPath]?
+                .childrenByDirectoryPath[sourcesPath]?
+                .map(\.name),
+            ["Fresh.swift"]
+        )
+        XCTAssertFalse(store.statesByProjectPath[normalizedProjectPath]?.loadingDirectoryPaths.contains(sourcesPath) ?? true)
+    }
+
+    @MainActor
+    func testCollapsedJavaSourceRootRejectsLatePreloadResult() async throws {
+        let fixture = try makeJavaPreloadFixture()
+        let store = WorkspaceProjectTreeStateStore(
+            statesByProjectPath: [fixture.projectPath: fixture.initialState]
+        )
+        let loader = ControlledDirectoryLoader(
+            staleResult: [fixture.staleFile],
+            freshResult: [fixture.freshFile]
+        )
+        defer { loader.releaseStaleLoad() }
+        let controller = makeController(
+            store: store,
+            normalizedProjectPath: fixture.projectPath,
+            listDirectory: { path in try loader.load(path) }
+        )
+
+        controller.toggleDirectory(fixture.javaPath, in: fixture.projectPath)
+        let stalePreloadStarted = await waitUntil(timeout: 1) { loader.callCount == 1 }
+        XCTAssertTrue(stalePreloadStarted)
+
+        controller.toggleDirectory(fixture.javaPath, in: fixture.projectPath)
+        controller.toggleDirectory(fixture.javaPath, in: fixture.projectPath)
+
+        let freshPreloadFinished = await waitUntil(timeout: 1) {
+            store.statesByProjectPath[fixture.projectPath]?
+                .childrenByDirectoryPath[fixture.comPath] == [fixture.freshFile]
+        }
+        XCTAssertTrue(freshPreloadFinished)
+
+        loader.releaseStaleLoad()
+        try? await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertEqual(
+            store.statesByProjectPath[fixture.projectPath]?
+                .childrenByDirectoryPath[fixture.comPath],
+            [fixture.freshFile]
+        )
+    }
+
+    @MainActor
+    func testRefreshRejectsLateJavaPackagePreloadResult() async throws {
+        let fixture = try makeJavaPreloadFixture()
+        try "class Fresh {}".write(
+            to: URL(fileURLWithPath: fixture.freshFile.path),
+            atomically: true,
+            encoding: .utf8
+        )
+        let store = WorkspaceProjectTreeStateStore(
+            statesByProjectPath: [fixture.projectPath: fixture.initialState]
+        )
+        let loader = ControlledDirectoryLoader(
+            staleResult: [fixture.staleFile],
+            freshResult: [fixture.freshFile]
+        )
+        defer { loader.releaseStaleLoad() }
+        let controller = makeController(
+            store: store,
+            normalizedProjectPath: fixture.projectPath,
+            listDirectory: { path in try loader.load(path) }
+        )
+
+        controller.toggleDirectory(fixture.javaPath, in: fixture.projectPath)
+        let stalePreloadStarted = await waitUntil(timeout: 1) { loader.callCount == 1 }
+        XCTAssertTrue(stalePreloadStarted)
+
+        controller.refreshProjectTree(for: fixture.projectPath)
+        let refreshFinished = await waitUntil(timeout: 1) {
+            !store.refreshingProjectPaths.contains(fixture.projectPath)
+                && store.statesByProjectPath[fixture.projectPath]?
+                    .childrenByDirectoryPath[fixture.comPath] == [fixture.freshFile]
+        }
+        XCTAssertTrue(refreshFinished)
+
+        loader.releaseStaleLoad()
+        try? await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertEqual(
+            store.statesByProjectPath[fixture.projectPath]?
+                .childrenByDirectoryPath[fixture.comPath],
+            [fixture.freshFile]
+        )
+    }
+
+    @MainActor
+    func testProjectCloseInvalidationRejectsPreloadFromPreviousState() async throws {
+        let fixture = try makeJavaPreloadFixture()
+        let store = WorkspaceProjectTreeStateStore(
+            statesByProjectPath: [fixture.projectPath: fixture.initialState]
+        )
+        let loader = ControlledDirectoryLoader(
+            staleResult: [fixture.staleFile],
+            freshResult: [fixture.freshFile]
+        )
+        defer { loader.releaseStaleLoad() }
+        let controller = makeController(
+            store: store,
+            normalizedProjectPath: fixture.projectPath,
+            listDirectory: { path in try loader.load(path) }
+        )
+
+        controller.toggleDirectory(fixture.javaPath, in: fixture.projectPath)
+        let stalePreloadStarted = await waitUntil(timeout: 1) { loader.callCount == 1 }
+        XCTAssertTrue(stalePreloadStarted)
+
+        controller.cancelDirectoryLoads(for: fixture.projectPath)
+        var reopenedState = fixture.initialState
+        reopenedState.expandedDirectoryPaths = [fixture.javaPath]
+        reopenedState.childrenByDirectoryPath[fixture.comPath] = [fixture.freshFile]
+        store.statesByProjectPath[fixture.projectPath] = reopenedState
+
+        loader.releaseStaleLoad()
+        try? await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertEqual(
+            store.statesByProjectPath[fixture.projectPath]?
+                .childrenByDirectoryPath[fixture.comPath],
+            [fixture.freshFile]
+        )
+    }
+
+    @MainActor
     private func makeController(
         store: WorkspaceProjectTreeStateStore,
         normalizedProjectPath: String,
+        listDirectory: (@Sendable (String) throws -> [WorkspaceProjectTreeNode])? = nil,
         syncGitSelection: @escaping @MainActor (String, String?) -> Void = { _, _ in }
     ) -> WorkspaceProjectTreeController {
         WorkspaceProjectTreeController(
             stateStore: store,
             fileSystemService: WorkspaceFileSystemService(),
+            listDirectory: listDirectory,
             diagnostics: .shared,
             normalizePath: { normalizeTestPath($0) },
             resolveProjectPath: { path in
@@ -117,6 +315,58 @@ final class WorkspaceProjectTreeControllerTests: XCTestCase {
             },
             syncGitSelection: syncGitSelection,
             reportError: { _ in }
+        )
+    }
+
+    private func makeJavaPreloadFixture() throws -> JavaPreloadFixture {
+        try createDirectory("src/main/java/com")
+        let projectPath = normalizeTestPath(projectURL.path)
+        let javaPath = normalizeTestPath(projectURL.appendingPathComponent("src/main/java").path)
+        let comPath = normalizeTestPath(projectURL.appendingPathComponent("src/main/java/com").path)
+        let stalePath = normalizeTestPath(projectURL.appendingPathComponent("src/main/java/com/Stale.java").path)
+        let freshPath = normalizeTestPath(projectURL.appendingPathComponent("src/main/java/com/Fresh.java").path)
+        let javaNode = WorkspaceProjectTreeNode(
+            path: javaPath,
+            parentPath: normalizeTestPath(projectURL.appendingPathComponent("src/main").path),
+            name: "java",
+            kind: .directory,
+            isHidden: false
+        )
+        let comNode = WorkspaceProjectTreeNode(
+            path: comPath,
+            parentPath: javaPath,
+            name: "com",
+            kind: .directory,
+            isHidden: false
+        )
+        let staleFile = WorkspaceProjectTreeNode(
+            path: stalePath,
+            parentPath: comPath,
+            name: "Stale.java",
+            kind: .file,
+            isHidden: false
+        )
+        let freshFile = WorkspaceProjectTreeNode(
+            path: freshPath,
+            parentPath: comPath,
+            name: "Fresh.java",
+            kind: .file,
+            isHidden: false
+        )
+        return JavaPreloadFixture(
+            projectPath: projectPath,
+            javaPath: javaPath,
+            comPath: comPath,
+            staleFile: staleFile,
+            freshFile: freshFile,
+            initialState: WorkspaceProjectTreeState(
+                rootProjectPath: projectPath,
+                rootNodes: [javaNode],
+                childrenByDirectoryPath: [
+                    projectPath: [javaNode],
+                    javaPath: [comNode],
+                ]
+            )
         )
     }
 
@@ -148,6 +398,48 @@ final class WorkspaceProjectTreeControllerTests: XCTestCase {
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
         return condition()
+    }
+}
+
+private struct JavaPreloadFixture {
+    let projectPath: String
+    let javaPath: String
+    let comPath: String
+    let staleFile: WorkspaceProjectTreeNode
+    let freshFile: WorkspaceProjectTreeNode
+    let initialState: WorkspaceProjectTreeState
+}
+
+private final class ControlledDirectoryLoader: @unchecked Sendable {
+    private let lock = NSLock()
+    private let staleLoadGate = DispatchSemaphore(value: 0)
+    private let staleResult: [WorkspaceProjectTreeNode]
+    private let freshResult: [WorkspaceProjectTreeNode]
+    private var storedCallCount = 0
+
+    init(staleResult: [WorkspaceProjectTreeNode], freshResult: [WorkspaceProjectTreeNode]) {
+        self.staleResult = staleResult
+        self.freshResult = freshResult
+    }
+
+    var callCount: Int {
+        lock.withLock { storedCallCount }
+    }
+
+    func load(_ path: String) throws -> [WorkspaceProjectTreeNode] {
+        let currentCall = lock.withLock {
+            storedCallCount += 1
+            return storedCallCount
+        }
+        if currentCall == 1 {
+            staleLoadGate.wait()
+            return staleResult
+        }
+        return freshResult
+    }
+
+    func releaseStaleLoad() {
+        staleLoadGate.signal()
     }
 }
 

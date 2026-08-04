@@ -4,6 +4,7 @@ import DevHavenCore
 
 struct ProjectSidebarView: View {
     @Bindable var viewModel: NativeAppViewModel
+    let onRequestCloseCLISession: (String) -> Void
     @State private var pendingDirectoryImportAction: ProjectDirectoryImportAction?
     @State private var isDirectoryImporterPresented = false
 
@@ -172,7 +173,7 @@ struct ProjectSidebarView: View {
                                     .buttonStyle(.plain)
 
                                     Button {
-                                        viewModel.closeWorkspaceProject(item.projectPath)
+                                        onRequestCloseCLISession(item.projectPath)
                                     } label: {
                                         Image(systemName: "xmark")
                                             .font(.caption.weight(.semibold))

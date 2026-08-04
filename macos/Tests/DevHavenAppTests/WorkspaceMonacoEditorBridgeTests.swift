@@ -1,9 +1,93 @@
 import XCTest
+import AppKit
+import WebKit
 @testable import DevHavenApp
 @testable import DevHavenCore
 
 @MainActor
 final class WorkspaceMonacoEditorBridgeTests: XCTestCase {
+    func testHiddenHostResignsDescendantFirstResponderWithoutTearingDown() {
+        let bridge = WorkspaceMonacoEditorBridge()
+        let focusedView = FocusableView(frame: NSRect(x: 0, y: 0, width: 20, height: 20))
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = bridge.webView
+        bridge.webView.addSubview(focusedView)
+        XCTAssertTrue(window.makeFirstResponder(focusedView))
+
+        bridge.setHostVisibility(false)
+
+        XCTAssertTrue(bridge.webView.isHidden)
+        XCTAssertFalse(window.firstResponder === focusedView)
+
+        bridge.setHostVisibility(true)
+        XCTAssertFalse(bridge.webView.isHidden)
+    }
+
+    func testVisibilityTogglePreservesLoadedEditorAndCursor() async throws {
+        let bridge = WorkspaceMonacoEditorBridge()
+        let payload = makePayload(text: "one\ntwo\nthree\n")
+        installBridge(bridge, payload: payload)
+        _ = try await waitForSnapshot(on: bridge)
+        bridge.goToLine(3)
+        _ = try await waitForSnapshot(on: bridge) { $0.lineNumber == 3 }
+        try await bridge.webView.evaluateJavaScript("window.__devHavenRetentionToken = 'editor-state';")
+
+        bridge.setHostVisibility(false)
+        bridge.setHostVisibility(true)
+
+        let snapshot = try await waitForSnapshot(on: bridge) { $0.lineNumber == 3 }
+        let retentionToken = try await bridge.webView.evaluateJavaScript(
+            "window.__devHavenRetentionToken"
+        ) as? String
+        XCTAssertEqual(snapshot.text, payload.text)
+        XCTAssertEqual(snapshot.lineNumber, 3)
+        XCTAssertEqual(retentionToken, "editor-state")
+        bridge.tearDown()
+    }
+
+    func testTearDownReleasesBridgeAndWebView() {
+        weak var weakBridge: WorkspaceMonacoEditorBridge?
+        weak var weakWebView: WKWebView?
+
+        autoreleasepool {
+            let owner = BridgeOwner()
+            let bridge = WorkspaceMonacoEditorBridge()
+            owner.bridge = bridge
+            bridge.update(
+                payload: makePayload(),
+                onContentChanged: { [owner] _ in
+                    _ = owner.bridge
+                },
+                onSaveRequested: {}
+            )
+            weakBridge = bridge
+            weakWebView = bridge.webView
+
+            bridge.tearDown()
+        }
+
+        XCTAssertNil(weakBridge)
+        XCTAssertNil(weakWebView)
+    }
+
+    func testBridgeReloadsAfterTearDown() async throws {
+        let bridge = WorkspaceMonacoEditorBridge()
+        installBridge(bridge, payload: makePayload(text: "first\n"))
+        _ = try await waitForSnapshot(on: bridge) { $0.text == "first\n" }
+
+        bridge.tearDown()
+        installBridge(bridge, payload: makePayload(text: "second\n"))
+
+        let snapshot = try await waitForSnapshot(on: bridge) { $0.text == "second\n" }
+        XCTAssertEqual(snapshot.text, "second\n")
+        bridge.tearDown()
+    }
+
     func testBridgeLoadsLocalMonacoAndAppliesInitialPayload() async throws {
         let bridge = WorkspaceMonacoEditorBridge()
         let payload = makePayload(
@@ -242,6 +326,16 @@ final class WorkspaceMonacoEditorBridgeTests: XCTestCase {
             renderWhitespace: rawSnapshot["renderWhitespace"] as? String,
             rulers: (rawSnapshot["rulers"] as? [NSNumber])?.map(\.intValue) ?? []
         )
+    }
+
+    private final class BridgeOwner {
+        var bridge: WorkspaceMonacoEditorBridge?
+    }
+
+    private final class FocusableView: NSView {
+        override var acceptsFirstResponder: Bool {
+            true
+        }
     }
 }
 

@@ -33,12 +33,11 @@ struct WorkspaceMarkdownRenderedContentView: View {
     @State private var contentHeight: CGFloat = 120
 
     var body: some View {
-        let html = WorkspaceMarkdownHTMLRenderer.documentHTML(for: content, baseURL: baseURL)
         let minimumHeight = layout.minimumHeight
 
         Group {
             WorkspaceMarkdownWebView(
-                html: html,
+                content: content,
                 baseURL: baseURL,
                 layout: layout,
                 contentHeight: $contentHeight
@@ -57,7 +56,7 @@ struct WorkspaceMarkdownRenderedContentView: View {
 }
 
 private struct WorkspaceMarkdownWebView: NSViewRepresentable {
-    let html: String
+    let content: String
     let baseURL: URL?
     let layout: WorkspaceMarkdownRenderedContentLayout
     @Binding var contentHeight: CGFloat
@@ -85,15 +84,17 @@ private struct WorkspaceMarkdownWebView: NSViewRepresentable {
         webView.setValue(false, forKey: "drawsBackground")
         webView.allowsBackForwardNavigationGestures = false
         webView.allowsMagnification = false
-        context.coordinator.update(html: html, baseURL: baseURL, layout: layout, on: webView)
+        context.coordinator.update(content: content, baseURL: baseURL, layout: layout, on: webView)
         return webView
     }
 
     func updateNSView(_ nsView: WKWebView, context: Context) {
-        context.coordinator.update(html: html, baseURL: baseURL, layout: layout, on: nsView)
+        context.coordinator.update(content: content, baseURL: baseURL, layout: layout, on: nsView)
     }
 
     static func dismantleNSView(_ nsView: WKWebView, coordinator: Coordinator) {
+        coordinator.tearDown()
+        nsView.stopLoading()
         nsView.navigationDelegate = nil
         nsView.configuration.userContentController.removeScriptMessageHandler(forName: Coordinator.heightMessageName)
     }
@@ -137,43 +138,57 @@ private struct WorkspaceMarkdownWebView: NSViewRepresentable {
         """
 
         @Binding private var contentHeight: CGFloat
-        private var lastHTML: String?
+        private var lastContent: String?
         private var lastBaseURL: String?
         private var lastUsesIntrinsicHeight = true
+        private var hasStartedShellLoad = false
+        private var isDocumentReady = false
+        private var pendingPreparedContent: String?
+        private var renderGeneration = 0
+        private var renderTask: Task<Void, Never>?
 
         init(contentHeight: Binding<CGFloat>) {
             _contentHeight = contentHeight
         }
 
         func update(
-            html: String,
+            content: String,
             baseURL: URL?,
             layout: WorkspaceMarkdownRenderedContentLayout,
             on webView: WKWebView
         ) {
             let resolvedBaseURL = baseURL?.absoluteString
             let usesIntrinsicHeight = layout.usesIntrinsicHeight
-            let shouldReload = lastHTML != html
-                || lastBaseURL != resolvedBaseURL
-                || lastUsesIntrinsicHeight != usesIntrinsicHeight
+            let shouldReloadShell = lastBaseURL != resolvedBaseURL
+            let shouldRenderContent = lastContent != content || shouldReloadShell
+            let needsShellLoad = shouldReloadShell || !hasStartedShellLoad
 
-            lastHTML = html
+            lastContent = content
             lastBaseURL = resolvedBaseURL
             lastUsesIntrinsicHeight = usesIntrinsicHeight
 
             configureEmbeddedScrollViewIfNeeded(in: webView, layout: layout)
 
-            guard shouldReload else {
-                if usesIntrinsicHeight {
-                    evaluateHeight(on: webView)
-                }
-                return
+            if needsShellLoad {
+                hasStartedShellLoad = true
+                isDocumentReady = false
+                pendingPreparedContent = nil
+                webView.loadHTMLString(
+                    WorkspaceMarkdownHTMLRenderer.documentHTML(for: "", baseURL: baseURL),
+                    baseURL: baseURL
+                )
             }
 
-            webView.loadHTMLString(html, baseURL: baseURL)
+            if shouldRenderContent || needsShellLoad {
+                scheduleRender(content: content, baseURL: baseURL, on: webView)
+            } else if usesIntrinsicHeight {
+                evaluateHeight(on: webView)
+            }
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            isDocumentReady = true
+            applyPendingContent(on: webView)
             let layout: WorkspaceMarkdownRenderedContentLayout = lastUsesIntrinsicHeight
                 ? .fitContent(minHeight: 0)
                 : .fillAvailableSpace
@@ -182,6 +197,51 @@ private struct WorkspaceMarkdownWebView: NSViewRepresentable {
                 return
             }
             evaluateHeight(on: webView)
+        }
+
+        func tearDown() {
+            renderGeneration &+= 1
+            renderTask?.cancel()
+            renderTask = nil
+            pendingPreparedContent = nil
+            isDocumentReady = false
+        }
+
+        private func scheduleRender(content: String, baseURL: URL?, on webView: WKWebView) {
+            renderGeneration &+= 1
+            let generation = renderGeneration
+            let shouldDebounce = lastContent != nil && isDocumentReady
+            renderTask?.cancel()
+            renderTask = Task { @MainActor [weak self, weak webView] in
+                guard let self else { return }
+                if shouldDebounce {
+                    try? await Task.sleep(for: .milliseconds(160))
+                    guard !Task.isCancelled else { return }
+                }
+                let preparedContent = await Task.detached(priority: .userInitiated) {
+                    WorkspaceMarkdownHTMLRenderer.preprocessMarkdownSource(content, baseURL: baseURL)
+                }.value
+                guard !Task.isCancelled,
+                      self.renderGeneration == generation,
+                      let webView
+                else {
+                    return
+                }
+                self.pendingPreparedContent = preparedContent
+                self.applyPendingContent(on: webView)
+            }
+        }
+
+        private func applyPendingContent(on webView: WKWebView) {
+            guard isDocumentReady, let pendingPreparedContent else {
+                return
+            }
+            self.pendingPreparedContent = nil
+            let literal = WorkspaceMarkdownHTMLRenderer.javaScriptStringLiteral(pendingPreparedContent)
+            webView.evaluateJavaScript(
+                "window.__devHavenRenderMarkdown?.(\(literal));",
+                completionHandler: nil
+            )
         }
 
         @MainActor
@@ -468,11 +528,10 @@ enum WorkspaceMarkdownHTMLRenderer {
           </script>
           <script>
             (function() {
-              const source = \(markdownLiteral);
               const container = document.getElementById('markdown-root');
-              const seenSlugs = Object.create(null);
-
-              function slugifyHeading(text) {
+              function renderMarkdown(source) {
+                const seenSlugs = Object.create(null);
+                function slugifyHeading(text) {
                 const base = text
                   .toLowerCase()
                   .normalize('NFKD')
@@ -485,19 +544,22 @@ enum WorkspaceMarkdownHTMLRenderer {
                 const count = seenSlugs[slug] || 0;
                 seenSlugs[slug] = count + 1;
                 return count === 0 ? slug : slug + '-' + count;
+                }
+
+                container.innerHTML = window.marked.parse(String(source || ''), {
+                  gfm: true,
+                  breaks: false
+                });
+
+                container.querySelectorAll('h1, h2, h3, h4, h5, h6').forEach((heading) => {
+                  if (!heading.id) {
+                    heading.id = slugifyHeading(heading.textContent || '');
+                  }
+                });
               }
 
-              const renderedHTML = window.marked.parse(source, {
-                gfm: true,
-                breaks: false
-              });
-              container.innerHTML = renderedHTML;
-
-              container.querySelectorAll('h1, h2, h3, h4, h5, h6').forEach((heading) => {
-                if (!heading.id) {
-                  heading.id = slugifyHeading(heading.textContent || '');
-                }
-              });
+              window.__devHavenRenderMarkdown = renderMarkdown;
+              renderMarkdown(\(markdownLiteral));
             })();
           </script>
         </body>
@@ -505,7 +567,7 @@ enum WorkspaceMarkdownHTMLRenderer {
         """
     }
 
-    private static func preprocessMarkdownSource(_ markdown: String, baseURL: URL?) -> String {
+    static func preprocessMarkdownSource(_ markdown: String, baseURL: URL?) -> String {
         var rewritten = markdown
         rewritten = rewriteRawHTMLImageSources(in: rewritten, baseURL: baseURL)
         rewritten = rewriteMarkdownImageSources(in: rewritten, baseURL: baseURL)
@@ -552,13 +614,18 @@ enum WorkspaceMarkdownHTMLRenderer {
         return absoluteString + "/"
     }
 
-    private static func javaScriptStringLiteral(_ string: String) -> String {
+    static func javaScriptStringLiteral(_ string: String) -> String {
         let encoder = JSONEncoder()
         guard let data = try? encoder.encode(string),
               let literal = String(data: data, encoding: .utf8) else {
             return "\"\""
         }
         return literal
+            .replacingOccurrences(of: "<", with: "\\u003C")
+            .replacingOccurrences(of: ">", with: "\\u003E")
+            .replacingOccurrences(of: "&", with: "\\u0026")
+            .replacingOccurrences(of: "\u{2028}", with: "\\u2028")
+            .replacingOccurrences(of: "\u{2029}", with: "\\u2029")
     }
 
     private static func resolvedImageSource(_ source: String, baseURL: URL?) -> String {
@@ -588,7 +655,7 @@ enum WorkspaceMarkdownHTMLRenderer {
     }
 
     private static func localImageDataURL(for fileURL: URL) -> String? {
-        guard let data = try? Data(contentsOf: fileURL),
+        guard let data = try? Data(contentsOf: fileURL, options: [.mappedIfSafe]),
               let mimeType = imageMimeType(for: fileURL) else {
             return nil
         }

@@ -2,6 +2,111 @@ import SwiftUI
 import GhosttyKit
 import DevHavenCore
 
+enum WorkspaceRetainedTabContentKey: Hashable {
+    case editor(String)
+    case diff(String)
+}
+
+struct WorkspaceRetainedTabContentInput: Equatable {
+    let openKeys: [WorkspaceRetainedTabContentKey]
+    let requiredKeys: [WorkspaceRetainedTabContentKey]
+
+    init(
+        items: [WorkspacePresentedTabItem],
+        selection: WorkspacePresentedTabSelection?,
+        splitEditorTabIDs: [String]
+    ) {
+        openKeys = items.compactMap { item in
+            switch item.selection {
+            case let .editor(tabID):
+                return .editor(tabID)
+            case let .diff(tabID):
+                return .diff(tabID)
+            case .terminal:
+                return nil
+            }
+        }
+
+        var requiredKeys: [WorkspaceRetainedTabContentKey] = []
+        switch selection {
+        case let .editor(tabID):
+            requiredKeys.append(contentsOf: splitEditorTabIDs.map(WorkspaceRetainedTabContentKey.editor))
+            requiredKeys.append(.editor(tabID))
+        case let .diff(tabID):
+            requiredKeys.append(.diff(tabID))
+        case .terminal, .none:
+            break
+        }
+        self.requiredKeys = requiredKeys.reduce(into: []) { result, key in
+            result.removeAll { $0 == key }
+            result.append(key)
+        }
+    }
+}
+
+struct WorkspaceRetainedTabContentIDs: Equatable {
+    let editorTabIDs: [String]
+    let diffTabIDs: [String]
+}
+
+struct WorkspaceRetainedTabContentCache: Equatable {
+    static let defaultCapacity = 8
+
+    let capacity: Int
+    private(set) var keys: [WorkspaceRetainedTabContentKey] = []
+
+    init(capacity: Int = defaultCapacity) {
+        self.capacity = max(1, capacity)
+    }
+
+    mutating func sync(_ input: WorkspaceRetainedTabContentInput) {
+        let openKeys = Set(input.openKeys)
+        keys.removeAll { !openKeys.contains($0) }
+
+        let requiredKeys = input.requiredKeys.filter(openKeys.contains)
+        requiredKeys.forEach { key in
+            keys.removeAll { $0 == key }
+            keys.append(key)
+        }
+
+        let requiredKeySet = Set(requiredKeys)
+        while keys.count > capacity,
+              let evictionIndex = keys.firstIndex(where: { !requiredKeySet.contains($0) }) {
+            keys.remove(at: evictionIndex)
+        }
+    }
+
+    func contentIDs(including input: WorkspaceRetainedTabContentInput) -> WorkspaceRetainedTabContentIDs {
+        var projectedCache = self
+        projectedCache.sync(input)
+
+        return WorkspaceRetainedTabContentIDs(
+            editorTabIDs: projectedCache.keys.compactMap { key in
+                guard case let .editor(tabID) = key else {
+                    return nil
+                }
+                return tabID
+            },
+            diffTabIDs: projectedCache.keys.compactMap { key in
+                guard case let .diff(tabID) = key else {
+                    return nil
+                }
+                return tabID
+            }
+        )
+    }
+}
+
+extension View {
+    func workspaceRetainedTabVisibility(_ isVisible: Bool) -> some View {
+        opacity(isVisible ? 1 : 0)
+            .allowsHitTesting(isVisible)
+            .accessibilityHidden(!isVisible)
+            .zIndex(isVisible ? 1 : 0)
+            .environment(\.workspaceRetainedTabIsVisible, isVisible)
+    }
+}
+
 struct WorkspaceHostView: View {
     @Bindable var viewModel: NativeAppViewModel
     let project: Project
@@ -11,6 +116,7 @@ struct WorkspaceHostView: View {
     @State private var windowActivity: WindowActivityState = .inactive
     @State private var isRunConfigurationSheetPresented = false
     @State private var runConsoleResizeStartHeight: CGFloat?
+    @State private var retainedTabContentCache = WorkspaceRetainedTabContentCache()
 
     var body: some View {
         let chromePolicy = WorkspaceChromePolicy.workspaceMinimal
@@ -18,6 +124,13 @@ struct WorkspaceHostView: View {
         let presentedTabs = presentedTabSnapshot.items
         let selectedPresentedTab = presentedTabSnapshot.selection
         let runToolbarState = viewModel.workspaceRunToolbarState(for: project.path)
+        let editorPresentation = viewModel.workspaceEditorPresentationState(for: project.path)
+        let retentionInput = WorkspaceRetainedTabContentInput(
+            items: presentedTabs,
+            selection: selectedPresentedTab,
+            splitEditorTabIDs: editorPresentation?.groups.compactMap(\.selectedTabID) ?? []
+        )
+        let retainedContent = retainedTabContentCache.contentIDs(including: retentionInput)
 
         VStack(alignment: .leading, spacing: chromePolicy.showsWorkspaceHeader ? 16 : 0) {
             if chromePolicy.showsWorkspaceHeader {
@@ -71,6 +184,7 @@ struct WorkspaceHostView: View {
                     selectedConfigurationID: runToolbarState.selectedConfigurationID,
                     canRun: runToolbarState.canRun,
                     canStop: runToolbarState.canStop,
+                    pendingRestart: runToolbarState.pendingRestart,
                     hasSessions: runToolbarState.hasSessions,
                     isLogsVisible: runToolbarState.isLogsVisible,
                     onSelectConfiguration: { viewModel.selectWorkspaceRunConfiguration($0, in: project.path) },
@@ -82,12 +196,18 @@ struct WorkspaceHostView: View {
                         }
                     },
                     onStop: { viewModel.stopSelectedWorkspaceRunSession(in: project.path) },
+                    onCancelRestart: {
+                        viewModel.cancelPendingWorkspaceRunRestart(in: project.path)
+                    },
                     onToggleLogs: { viewModel.toggleWorkspaceRunConsole(in: project.path) },
                     onConfigure: { isRunConfigurationSheetPresented = true }
                 )
             }
 
-            workspacePresentedContent(selectedPresentedTab)
+            workspacePresentedContent(
+                retainedContent,
+                selection: selectedPresentedTab
+            )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             if let runConsoleState = viewModel.workspaceRunConsoleState(for: project.path),
@@ -123,6 +243,7 @@ struct WorkspaceHostView: View {
             .frame(width: 0, height: 0)
         }
         .onAppear {
+            retainedTabContentCache.sync(retentionInput)
             terminalSessionStore.syncSelectedItemIDs(selectedItemIDsByPane)
             terminalSessionStore.syncRetainedItemIDs(retainedItemIDs)
             browserSessionStore.syncRetainedItemIDs(retainedItemIDs)
@@ -137,6 +258,9 @@ struct WorkspaceHostView: View {
         .onChange(of: retainedItemIDs) { _, itemIDs in
             terminalSessionStore.syncRetainedItemIDs(itemIDs)
             browserSessionStore.syncRetainedItemIDs(itemIDs)
+        }
+        .onChange(of: retentionInput) { _, input in
+            retainedTabContentCache.sync(input)
         }
     }
 
@@ -227,6 +351,12 @@ struct WorkspaceHostView: View {
                     } catch {
                         // 错误已由 ViewModel 收口
                     }
+                },
+                onCancelRestart: { configurationID in
+                    viewModel.cancelPendingWorkspaceRunRestart(
+                        configurationID: configurationID,
+                        in: project.path
+                    )
                 },
                 onHide: {
                     runConsoleResizeStartHeight = nil
@@ -338,38 +468,55 @@ struct WorkspaceHostView: View {
     }
 
     @ViewBuilder
-    private func workspacePresentedContent(_ selection: WorkspacePresentedTabSelection?) -> some View {
-        switch selection {
-        case let .editor(editorTabID):
+    private func workspacePresentedContent(
+        _ retainedContent: WorkspaceRetainedTabContentIDs,
+        selection: WorkspacePresentedTabSelection?
+    ) -> some View {
+        ZStack {
+            if selection == nil || isTerminalSelection(selection) {
+                terminalTabContent
+                    .zIndex(1)
+            }
+
             if let presentation = viewModel.workspaceEditorPresentationState(for: project.path),
-               presentation.groups.count > 1 {
+               presentation.groups.count > 1,
+               !retainedContent.editorTabIDs.isEmpty {
                 WorkspaceEditorSplitContentView(
                     viewModel: viewModel,
                     projectPath: project.path,
-                    presentation: presentation
+                    presentation: presentation,
+                    retainedEditorTabIDs: Set(retainedContent.editorTabIDs)
                 )
-            } else if viewModel.workspaceEditorTabState(for: project.path, tabID: editorTabID) != nil {
-                WorkspaceEditorTabView(
-                    viewModel: viewModel,
-                    projectPath: project.path,
-                    tabID: editorTabID
-                )
-                .id(editorTabID)
-                .contentShape(Rectangle())
-                .simultaneousGesture(
-                    TapGesture().onEnded {
-                        viewModel.setWorkspaceFocusedArea(.editorTab(editorTabID))
-                    }
-                )
+                .workspaceRetainedTabVisibility(isEditorSelection(selection))
             } else {
-                editorTabUnavailableContent
+                ForEach(retainedContent.editorTabIDs, id: \.self) { editorTabID in
+                    if viewModel.workspaceEditorTabState(for: project.path, tabID: editorTabID) != nil {
+                        WorkspaceEditorTabView(
+                            viewModel: viewModel,
+                            projectPath: project.path,
+                            tabID: editorTabID
+                        )
+                        .id(editorTabID)
+                        .contentShape(Rectangle())
+                        .simultaneousGesture(
+                            TapGesture().onEnded {
+                                viewModel.setWorkspaceFocusedArea(.editorTab(editorTabID))
+                            }
+                        )
+                        .workspaceRetainedTabVisibility(selection == .editor(editorTabID))
+                    }
+                }
             }
-        case let .diff(diffTabID):
-            if let diffViewModel = viewModel.workspaceDiffTabViewModel(for: project.path, tabID: diffTabID) {
-                WorkspaceDiffTabView(
-                    viewModel: diffViewModel,
-                    displayOptions: viewModel.workspaceEditorDisplayOptions
-                )
+
+            ForEach(retainedContent.diffTabIDs, id: \.self) { diffTabID in
+                if let diffViewModel = viewModel.workspaceDiffTabViewModel(
+                    for: project.path,
+                    tabID: diffTabID
+                ) {
+                    WorkspaceDiffTabView(
+                        viewModel: diffViewModel,
+                        displayOptions: viewModel.workspaceEditorDisplayOptions
+                    )
                     .id(diffTabID)
                     .contentShape(Rectangle())
                     .simultaneousGesture(
@@ -377,12 +524,34 @@ struct WorkspaceHostView: View {
                             viewModel.setWorkspaceFocusedArea(.diffTab(diffTabID))
                         }
                     )
-            } else {
+                    .workspaceRetainedTabVisibility(selection == .diff(diffTabID))
+                }
+            }
+
+            if case let .editor(editorTabID) = selection,
+               viewModel.workspaceEditorTabState(for: project.path, tabID: editorTabID) == nil {
+                editorTabUnavailableContent
+            }
+
+            if case let .diff(diffTabID) = selection,
+               viewModel.workspaceDiffTabViewModel(for: project.path, tabID: diffTabID) == nil {
                 diffTabUnavailableContent
             }
-        case .terminal, .none:
-            terminalTabContent
         }
+    }
+
+    private func isTerminalSelection(_ selection: WorkspacePresentedTabSelection?) -> Bool {
+        guard case .terminal = selection else {
+            return false
+        }
+        return true
+    }
+
+    private func isEditorSelection(_ selection: WorkspacePresentedTabSelection?) -> Bool {
+        guard case .editor = selection else {
+            return false
+        }
+        return true
     }
 
     @ViewBuilder

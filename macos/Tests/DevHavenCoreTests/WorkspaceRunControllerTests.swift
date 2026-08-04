@@ -90,6 +90,120 @@ final class WorkspaceRunControllerTests: XCTestCase {
         XCTAssertNotNil(consoleState.selectedSession?.endedAt)
     }
 
+    func testRestartWaitsForPreviousSessionTerminalStateAndCoalescesRepeatedClicks() throws {
+        let projectPath = "/tmp/devhaven-run-controller/restart"
+        let session = OpenWorkspaceSessionState(
+            projectPath: projectPath,
+            controller: GhosttyWorkspaceController(projectPath: projectPath)
+        )
+        let configuration = WorkspaceRunConfiguration(
+            id: "run-app",
+            projectPath: projectPath,
+            rootProjectPath: projectPath,
+            source: .projectRunConfiguration,
+            sourceID: "project-config",
+            name: "Run App",
+            executable: .shell(command: "npm run dev"),
+            displayCommand: "npm run dev",
+            workingDirectory: projectPath,
+            isShared: false
+        )
+        let runManager = MockWorkspaceRunManager()
+        let controller = makeController(
+            runManager: runManager,
+            activeProjectPath: { projectPath },
+            openProjectPaths: { [projectPath] },
+            workspaceSession: { path in path == projectPath ? session : nil },
+            availableConfigurations: { _ in [configuration] }
+        )
+
+        try controller.runSelectedConfiguration()
+        let firstSessionID = try XCTUnwrap(runManager.startRequests.first?.sessionID)
+
+        try controller.runSelectedConfiguration()
+        try controller.runSelectedConfiguration()
+        controller.stopSelectedSession(in: projectPath)
+
+        XCTAssertEqual(runManager.startRequests.count, 1)
+        XCTAssertEqual(runManager.stoppedSessionIDs, [firstSessionID])
+        XCTAssertEqual(controller.consoleState(for: projectPath)?.selectedSession?.id, firstSessionID)
+        XCTAssertEqual(
+            controller.consoleState(for: projectPath)?.pendingRestarts.first?.configurationID,
+            configuration.id
+        )
+        XCTAssertEqual(
+            controller.toolbarState(for: projectPath).pendingRestart?.configurationID,
+            configuration.id
+        )
+        XCTAssertFalse(controller.toolbarState(for: projectPath).canRun)
+        XCTAssertFalse(controller.toolbarState(for: projectPath).canStop)
+
+        runManager.onEvent?(.stateChanged(
+            projectPath: projectPath,
+            sessionID: firstSessionID,
+            state: .stopped
+        ))
+
+        XCTAssertEqual(runManager.startRequests.count, 2)
+        XCTAssertNotEqual(runManager.startRequests.last?.sessionID, firstSessionID)
+        XCTAssertEqual(controller.consoleState(for: projectPath)?.selectedSession?.state, .running)
+        XCTAssertTrue(controller.consoleState(for: projectPath)?.pendingRestarts.isEmpty == true)
+        XCTAssertNil(controller.toolbarState(for: projectPath).pendingRestart)
+
+        runManager.onEvent?(.stateChanged(
+            projectPath: projectPath,
+            sessionID: firstSessionID,
+            state: .stopped
+        ))
+        XCTAssertEqual(runManager.startRequests.count, 2)
+    }
+
+    func testCancellingPendingRestartPreventsLateTerminalStateFromStartingNewSession() throws {
+        let projectPath = "/tmp/devhaven-run-controller/cancel-restart"
+        let session = OpenWorkspaceSessionState(
+            projectPath: projectPath,
+            controller: GhosttyWorkspaceController(projectPath: projectPath)
+        )
+        let configuration = WorkspaceRunConfiguration(
+            id: "run-app",
+            projectPath: projectPath,
+            rootProjectPath: projectPath,
+            source: .projectRunConfiguration,
+            sourceID: "project-config",
+            name: "Run App",
+            executable: .shell(command: "npm run dev"),
+            displayCommand: "npm run dev",
+            workingDirectory: projectPath,
+            isShared: false
+        )
+        let runManager = MockWorkspaceRunManager()
+        let controller = makeController(
+            runManager: runManager,
+            activeProjectPath: { projectPath },
+            openProjectPaths: { [projectPath] },
+            workspaceSession: { path in path == projectPath ? session : nil },
+            availableConfigurations: { _ in [configuration] }
+        )
+
+        try controller.runSelectedConfiguration()
+        let firstSessionID = try XCTUnwrap(runManager.startRequests.first?.sessionID)
+        try controller.runSelectedConfiguration()
+
+        controller.cancelPendingRestart(in: projectPath)
+
+        XCTAssertTrue(controller.consoleState(for: projectPath)?.pendingRestarts.isEmpty == true)
+        XCTAssertNil(controller.toolbarState(for: projectPath).pendingRestart)
+
+        runManager.onEvent?(.stateChanged(
+            projectPath: projectPath,
+            sessionID: firstSessionID,
+            state: .stopped
+        ))
+
+        XCTAssertEqual(runManager.startRequests.count, 1)
+        XCTAssertEqual(controller.consoleState(for: projectPath)?.selectedSession?.state, .stopped)
+    }
+
     func testRetainConsoleStateDropsClosedProjects() throws {
         let projectA = "/tmp/devhaven-run-controller/a"
         let projectB = "/tmp/devhaven-run-controller/b"
@@ -156,14 +270,27 @@ final class WorkspaceRunControllerTests: XCTestCase {
         try controller.runSelectedConfiguration()
         activeProjectPathBox.value = projectB
         try controller.runSelectedConfiguration()
+        let projectBSessionID = try XCTUnwrap(runManager.startRequests.last?.sessionID)
+        try controller.runSelectedConfiguration()
 
         XCTAssertNotNil(controller.consoleState(for: projectA))
         XCTAssertNotNil(controller.consoleState(for: projectB))
+        XCTAssertEqual(
+            controller.consoleState(for: projectB)?.pendingRestarts.first?.stoppedSessionID,
+            projectBSessionID
+        )
 
         controller.retainConsoleState(for: [projectA])
 
         XCTAssertNotNil(controller.consoleState(for: projectA))
         XCTAssertNil(controller.consoleState(for: projectB))
+
+        runManager.onEvent?(.stateChanged(
+            projectPath: projectB,
+            sessionID: projectBSessionID,
+            state: .stopped
+        ))
+        XCTAssertEqual(runManager.startRequests.count, 2)
     }
 
     private func makeController(
@@ -191,6 +318,7 @@ final class WorkspaceRunControllerTests: XCTestCase {
 private final class MockWorkspaceRunManager: WorkspaceRunManaging {
     var onEvent: (@MainActor @Sendable (WorkspaceRunManagerEvent) -> Void)?
     var startRequests: [WorkspaceRunStartRequest] = []
+    var stoppedSessionIDs: [String] = []
 
     func start(_ request: WorkspaceRunStartRequest) throws -> WorkspaceRunSession {
         startRequests.append(request)
@@ -209,7 +337,9 @@ private final class MockWorkspaceRunManager: WorkspaceRunManaging {
         )
     }
 
-    func stop(sessionID: String) {}
+    func stop(sessionID: String) {
+        stoppedSessionIDs.append(sessionID)
+    }
 
     func stopAll(projectPath: String) {}
 }

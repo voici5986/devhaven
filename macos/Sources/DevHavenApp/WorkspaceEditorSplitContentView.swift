@@ -5,6 +5,7 @@ struct WorkspaceEditorSplitContentView: View {
     @Bindable var viewModel: NativeAppViewModel
     let projectPath: String
     let presentation: WorkspaceEditorPresentationState
+    let retainedEditorTabIDs: Set<String>
 
     var body: some View {
         let groups = Array(presentation.groups.prefix(2))
@@ -35,7 +36,9 @@ struct WorkspaceEditorSplitContentView: View {
     @ViewBuilder
     private func editorPane(for group: WorkspaceEditorGroupState) -> some View {
         let tabs = group.tabIDs.compactMap { viewModel.workspaceEditorTabState(for: projectPath, tabID: $0) }
+        let retainedTabs = tabs.filter { retainedEditorTabIDs.contains($0.id) }
         let selectedTabID = group.selectedTabID ?? group.tabIDs.last
+        let hasSelectedTab = tabs.contains { $0.id == selectedTabID }
         let isActive = presentation.activeGroupID == group.id
         let oppositeGroupID = presentation.groups.first(where: { $0.id != group.id })?.id
 
@@ -49,23 +52,25 @@ struct WorkspaceEditorSplitContentView: View {
             )
             Divider()
 
-            Group {
-                if let selectedTabID,
-                   viewModel.workspaceEditorTabState(for: projectPath, tabID: selectedTabID) != nil {
+            ZStack {
+                ForEach(retainedTabs) { tab in
                     WorkspaceEditorTabView(
                         viewModel: viewModel,
                         projectPath: projectPath,
-                        tabID: selectedTabID
+                        tabID: tab.id
                     )
-                    .id("workspace-editor-group-\(group.id)-\(selectedTabID)")
+                    .id("workspace-editor-group-\(group.id)-\(tab.id)")
                     .contentShape(Rectangle())
                     .simultaneousGesture(
                         TapGesture().onEnded {
                             viewModel.selectWorkspaceEditorGroup(group.id, in: projectPath)
-                            viewModel.selectWorkspacePresentedTab(.editor(selectedTabID), in: projectPath)
+                            viewModel.selectWorkspacePresentedTab(.editor(tab.id), in: projectPath)
                         }
                     )
-                } else {
+                    .workspaceRetainedTabVisibility(tab.id == selectedTabID)
+                }
+
+                if !hasSelectedTab {
                     ContentUnavailableView(
                         "空白编辑器分栏",
                         systemImage: "square.split.2x1",

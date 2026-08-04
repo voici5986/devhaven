@@ -361,11 +361,13 @@ private struct ReadmeRunPreviewView: View {
                     selectedConfigurationID: "devhaven-app",
                     canRun: true,
                     canStop: true,
+                    pendingRestart: nil,
                     hasSessions: true,
                     isLogsVisible: true,
                     onSelectConfiguration: { _ in },
                     onRun: {},
                     onStop: {},
+                    onCancelRestart: {},
                     onToggleLogs: {},
                     onConfigure: {}
                 )
@@ -380,6 +382,7 @@ private struct ReadmeRunPreviewView: View {
                 onSelectSession: { _ in },
                 onClear: {},
                 onOpenLog: {},
+                onCancelRestart: { _ in },
                 onHide: {}
             )
         }

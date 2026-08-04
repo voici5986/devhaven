@@ -39,7 +39,10 @@ struct AppRootView: View {
         ZStack(alignment: .trailing) {
             HStack(spacing: 0) {
                 if chromePolicy.showsGlobalSidebar {
-                    ProjectSidebarView(viewModel: viewModel)
+                    ProjectSidebarView(
+                        viewModel: viewModel,
+                        onRequestCloseCLISession: requestCloseWorkspaceProject
+                    )
                         .frame(width: 240)
                         .background(NativeTheme.sidebar)
                 }
@@ -345,6 +348,30 @@ struct AppRootView: View {
             actionDescription: "关闭整个窗格"
         ) {
             viewModel.closeWorkspacePane(paneID)
+        }
+    }
+
+    private func requestCloseWorkspaceProject(_ projectPath: String) {
+        let affectedProjectPaths = viewModel.workspaceProjectCloseAffectedPaths(projectPath)
+        guard !affectedProjectPaths.isEmpty else {
+            viewModel.closeWorkspaceProject(projectPath)
+            return
+        }
+
+        let evaluators = WorkspaceTerminalCloseCoordinator.evaluatorsForProjectClose(
+            sessions: viewModel.openWorkspaceSessions,
+            affectedProjectPaths: affectedProjectPaths
+        ) { projectPath, itemID in
+            workspaceTerminalStoreRegistry.modelIfLoaded(
+                for: projectPath,
+                itemID: itemID
+            ).map { $0 as any WorkspaceTerminalCloseRequirementEvaluating }
+        }
+        WorkspaceTerminalCloseCoordinator.confirmIfNeeded(
+            evaluators: evaluators,
+            actionDescription: "关闭项目"
+        ) {
+            viewModel.closeWorkspaceProject(projectPath)
         }
     }
 

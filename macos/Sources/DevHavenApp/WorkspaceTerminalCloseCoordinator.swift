@@ -1,4 +1,5 @@
 import AppKit
+import DevHavenCore
 
 enum WorkspaceTerminalCloseRequirement: Equatable {
     case canClose
@@ -67,6 +68,28 @@ struct AppKitWorkspaceTerminalClosePrompt: WorkspaceTerminalClosePrompting {
 
 @MainActor
 enum WorkspaceTerminalCloseCoordinator {
+    static func evaluatorsForProjectClose(
+        sessions: [OpenWorkspaceSessionState],
+        affectedProjectPaths: [String],
+        resolveEvaluator: (_ projectPath: String, _ terminalItemID: String) -> (any WorkspaceTerminalCloseRequirementEvaluating)?
+    ) -> [any WorkspaceTerminalCloseRequirementEvaluating] {
+        let affectedPathSet = Set(affectedProjectPaths)
+        return sessions
+            .filter { affectedPathSet.contains($0.projectPath) }
+            .flatMap { session in
+                session.controller.tabs.flatMap { tab in
+                    tab.leaves.flatMap { pane in
+                        pane.items.compactMap { item in
+                            guard item.isTerminal else {
+                                return nil
+                            }
+                            return resolveEvaluator(session.projectPath, item.id)
+                        }
+                    }
+                }
+            }
+    }
+
     static func confirmIfNeeded(
         evaluators: [any WorkspaceTerminalCloseRequirementEvaluating],
         actionDescription: String,

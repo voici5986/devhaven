@@ -296,6 +296,74 @@ final class WorkspaceEditorTabEditingPersistenceTests: XCTestCase {
         XCTAssertEqual(heading, "DevHaven")
     }
 
+    @MainActor
+    func testMarkdownPreviewUpdatesInPlaceAndPreservesScrollPosition() async throws {
+        let initialContent = (["# Initial"] + (1...120).map { "Paragraph \($0): persistent preview content." })
+            .joined(separator: "\n\n")
+        let fileURL = projectURL.appendingPathComponent("README.md")
+        try initialContent.write(to: fileURL, atomically: true, encoding: .utf8)
+
+        let viewModel = NativeAppViewModel(store: LegacyCompatStore(homeDirectoryURL: homeURL))
+        viewModel.snapshot = NativeAppSnapshot(projects: [makeProject()])
+        viewModel.enterWorkspace(projectURL.path)
+        viewModel.openWorkspaceEditorTab(for: fileURL.path, in: projectURL.path)
+        let tabID = try XCTUnwrap(viewModel.activeWorkspaceEditorTabs.first?.id)
+
+        var session = viewModel.workspaceEditorRuntimeSession(for: projectURL.path, tabID: tabID)
+        session.markdownPresentationMode = .preview
+        viewModel.updateWorkspaceEditorRuntimeSession(session, tabID: tabID, in: projectURL.path)
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 900, height: 600),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        defer { window.orderOut(nil) }
+
+        let hostingView = NSHostingView(
+            rootView: WorkspaceEditorTabView(
+                viewModel: viewModel,
+                projectPath: projectURL.path,
+                tabID: tabID
+            )
+            .frame(width: 900, height: 600)
+        )
+        window.contentView = hostingView
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        pumpMainRunLoop(ticks: 16)
+
+        let previewWebView = try await waitForMarkdownPreviewWebView(in: hostingView)
+        _ = try await waitForJavaScriptString(
+            in: previewWebView,
+            script: "document.querySelector('h1')?.textContent ?? ''",
+            expected: "Initial"
+        )
+        try await previewWebView.evaluateJavaScript("window.scrollTo(0, 500)")
+        pumpMainRunLoop(ticks: 8)
+        let initialScrollResult = try await previewWebView.evaluateJavaScript("window.scrollY")
+        let initialScrollY = try XCTUnwrap(initialScrollResult as? Double)
+        XCTAssertGreaterThan(initialScrollY, 400)
+
+        viewModel.updateWorkspaceEditorText(
+            initialContent + "\n\n## Updated in place",
+            tabID: tabID,
+            in: projectURL.path
+        )
+        _ = try await waitForJavaScriptString(
+            in: previewWebView,
+            script: "Array.from(document.querySelectorAll('h2')).at(-1)?.textContent ?? ''",
+            expected: "Updated in place"
+        )
+
+        let currentPreviewWebView = try await waitForMarkdownPreviewWebView(in: hostingView)
+        XCTAssertTrue(currentPreviewWebView === previewWebView)
+        let updatedScrollResult = try await currentPreviewWebView.evaluateJavaScript("window.scrollY")
+        let updatedScrollY = try XCTUnwrap(updatedScrollResult as? Double)
+        XCTAssertEqual(updatedScrollY, initialScrollY, accuracy: 2)
+    }
+
     private func makeProject() -> Project {
         let now = Date().timeIntervalSinceReferenceDate
         return Project(

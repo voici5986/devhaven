@@ -17,6 +17,7 @@ private struct WorkspaceProjectTreeDirectoryLoadResult: Sendable {
 final class WorkspaceProjectTreeController {
     private let stateStore: WorkspaceProjectTreeStateStore
     private let fileSystemService: WorkspaceFileSystemService
+    private let listDirectory: @Sendable (String) throws -> [WorkspaceProjectTreeNode]
     private let diagnostics: WorkspaceProjectTreeDiagnostics
     private let normalizePath: @MainActor (String) -> String
     private let resolveProjectPath: @MainActor (String?) -> String?
@@ -27,6 +28,7 @@ final class WorkspaceProjectTreeController {
     init(
         stateStore: WorkspaceProjectTreeStateStore,
         fileSystemService: WorkspaceFileSystemService,
+        listDirectory: (@Sendable (String) throws -> [WorkspaceProjectTreeNode])? = nil,
         diagnostics: WorkspaceProjectTreeDiagnostics,
         normalizePath: @escaping @MainActor (String) -> String,
         resolveProjectPath: @escaping @MainActor (String?) -> String?,
@@ -36,6 +38,9 @@ final class WorkspaceProjectTreeController {
     ) {
         self.stateStore = stateStore
         self.fileSystemService = fileSystemService
+        self.listDirectory = listDirectory ?? { path in
+            try fileSystemService.listDirectory(at: path)
+        }
         self.diagnostics = diagnostics
         self.normalizePath = normalizePath
         self.resolveProjectPath = resolveProjectPath
@@ -114,6 +119,10 @@ final class WorkspaceProjectTreeController {
         )
     }
 
+    func cancelDirectoryLoads(for projectPath: String) {
+        invalidateDirectoryLoads(for: normalizePath(projectPath))
+    }
+
     func selectProjectTreeNode(_ path: String?, in projectPath: String? = nil) {
         guard let resolvedProjectPath = resolveProjectPath(projectPath),
               var state = stateStore.statesByProjectPath[resolvedProjectPath]
@@ -137,6 +146,10 @@ final class WorkspaceProjectTreeController {
             ?? normalizePath(directoryPath)
 
         if state.expandedDirectoryPaths.contains(normalizedDirectoryPath) {
+            invalidateDirectoryLoad(
+                projectPath: resolvedProjectPath,
+                directoryPath: normalizedDirectoryPath
+            )
             state.expandedDirectoryPaths.remove(normalizedDirectoryPath)
             state.loadingDirectoryPaths.remove(normalizedDirectoryPath)
             stateStore.statesByProjectPath[resolvedProjectPath] = state
@@ -174,26 +187,38 @@ final class WorkspaceProjectTreeController {
         )
 
         let projectRootPath = resolvedProjectPath
-        let fileSystemService = fileSystemService
+        let listDirectory = listDirectory
+        let loadKey = WorkspaceProjectTreeDirectoryLoadKey(
+            projectPath: resolvedProjectPath,
+            directoryPath: normalizedDirectoryPath
+        )
+        stateStore.directoryLoadTasksByKey[loadKey]?.cancel()
+        let loadGeneration = (stateStore.directoryLoadGenerationByKey[loadKey] ?? 0) &+ 1
+        stateStore.directoryLoadGenerationByKey[loadKey] = loadGeneration
         let startTime = ProcessInfo.processInfo.systemUptime
-        Task.detached(priority: .userInitiated) { [weak self] in
+        stateStore.directoryLoadTasksByKey[loadKey] = Task.detached(priority: .userInitiated) { [weak self] in
             do {
                 let result = try Self.loadChildrenSnapshot(
-                    service: fileSystemService,
+                    listDirectory: listDirectory,
                     directoryPath: normalizedDirectoryPath,
                     projectRootPath: projectRootPath
                 )
+                try Task.checkCancellation()
                 await self?.finishDirectoryLoadSuccess(
                     for: resolvedProjectPath,
                     directoryPath: normalizedDirectoryPath,
+                    generation: loadGeneration,
                     result: result,
                     startTime: startTime
                 )
+            } catch is CancellationError {
+                return
             } catch {
                 let errorDescription = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                 await self?.finishDirectoryLoadFailure(
                     for: resolvedProjectPath,
                     directoryPath: normalizedDirectoryPath,
+                    generation: loadGeneration,
                     errorDescription: errorDescription,
                     startTime: startTime
                 )
@@ -204,13 +229,22 @@ final class WorkspaceProjectTreeController {
     private func finishDirectoryLoadSuccess(
         for projectPath: String,
         directoryPath: String,
+        generation: Int,
         result: WorkspaceProjectTreeDirectoryLoadResult,
         startTime: TimeInterval
     ) {
-        guard var latestState = stateStore.statesByProjectPath[projectPath] else {
+        let loadKey = WorkspaceProjectTreeDirectoryLoadKey(
+            projectPath: projectPath,
+            directoryPath: directoryPath
+        )
+        guard stateStore.directoryLoadGenerationByKey[loadKey] == generation,
+              var latestState = stateStore.statesByProjectPath[projectPath],
+              latestState.expandedDirectoryPaths.contains(directoryPath)
+        else {
             return
         }
 
+        stateStore.directoryLoadTasksByKey[loadKey] = nil
         latestState.loadingDirectoryPaths.remove(directoryPath)
         for (path, children) in result.childrenByDirectoryPath {
             latestState.childrenByDirectoryPath[path] = children
@@ -235,13 +269,22 @@ final class WorkspaceProjectTreeController {
     private func finishDirectoryLoadFailure(
         for projectPath: String,
         directoryPath: String,
+        generation: Int,
         errorDescription: String,
         startTime: TimeInterval
     ) {
-        guard var latestState = stateStore.statesByProjectPath[projectPath] else {
+        let loadKey = WorkspaceProjectTreeDirectoryLoadKey(
+            projectPath: projectPath,
+            directoryPath: directoryPath
+        )
+        guard stateStore.directoryLoadGenerationByKey[loadKey] == generation,
+              var latestState = stateStore.statesByProjectPath[projectPath],
+              latestState.expandedDirectoryPaths.contains(directoryPath)
+        else {
             return
         }
 
+        stateStore.directoryLoadTasksByKey[loadKey] = nil
         latestState.loadingDirectoryPaths.remove(directoryPath)
         latestState.errorMessage = errorDescription
         stateStore.statesByProjectPath[projectPath] = latestState
@@ -263,47 +306,133 @@ final class WorkspaceProjectTreeController {
         projectRootPath: String,
         children: [WorkspaceProjectTreeNode]
     ) {
-        let fileSystemService = fileSystemService
+        let listDirectory = listDirectory
         let startRevision = stateStore.statesByProjectPath[projectRootPath]?.revision ?? 0
         let startTime = ProcessInfo.processInfo.systemUptime
-        Task.detached(priority: .utility) { [weak self] in
-            guard let self else {
+        let loadKey = WorkspaceProjectTreeDirectoryLoadKey(
+            projectPath: projectRootPath,
+            directoryPath: directoryPath
+        )
+        stateStore.directoryLoadTasksByKey[loadKey]?.cancel()
+        let loadGeneration = (stateStore.directoryLoadGenerationByKey[loadKey] ?? 0) &+ 1
+        stateStore.directoryLoadGenerationByKey[loadKey] = loadGeneration
+        stateStore.directoryLoadTasksByKey[loadKey] = Task.detached(priority: .utility) { [weak self] in
+            let result: [String: [WorkspaceProjectTreeNode]]
+            do {
+                result = try Self.preloadVisibleChainsSnapshot(
+                    listDirectory: listDirectory,
+                    children: children,
+                    projectRootPath: projectRootPath
+                )
+                try Task.checkCancellation()
+            } catch is CancellationError {
                 return
-            }
-            guard let result = try? Self.preloadVisibleChainsSnapshot(
-                service: fileSystemService,
-                children: children,
-                projectRootPath: projectRootPath
-            ), !result.isEmpty else {
+            } catch {
+                await self?.finishVisibleChainPreload(
+                    for: projectRootPath,
+                    directoryPath: directoryPath,
+                    generation: loadGeneration,
+                    sourceChildren: children,
+                    result: nil,
+                    startRevision: startRevision,
+                    startTime: startTime
+                )
                 return
             }
 
-            await MainActor.run {
-                guard var latestState = self.stateStore.statesByProjectPath[projectRootPath] else {
-                    return
-                }
-                var didMerge = false
-                for (path, loadedChildren) in result where latestState.childrenByDirectoryPath[path] != loadedChildren {
-                    latestState.childrenByDirectoryPath[path] = loadedChildren
-                    didMerge = true
-                }
-                guard didMerge else {
-                    return
-                }
-                latestState.advanceStructureRevision()
-                let finalizedState = latestState.canonicalizedForDisplay()
-                self.stateStore.statesByProjectPath[projectRootPath] = finalizedState
-                self.diagnostics.recordDirectoryLoadFinished(
-                    projectPath: projectRootPath,
-                    directoryPath: directoryPath,
-                    revision: max(startRevision, finalizedState.revision),
-                    durationMs: elapsedMillisecondsSince(startTime),
-                    loadedDirectoryCount: result.count,
-                    directChildCount: children.count,
-                    status: "success",
-                    errorDescription: nil
-                )
-            }
+            await self?.finishVisibleChainPreload(
+                for: projectRootPath,
+                directoryPath: directoryPath,
+                generation: loadGeneration,
+                sourceChildren: children,
+                result: result,
+                startRevision: startRevision,
+                startTime: startTime
+            )
+        }
+    }
+
+    private func finishVisibleChainPreload(
+        for projectPath: String,
+        directoryPath: String,
+        generation: Int,
+        sourceChildren: [WorkspaceProjectTreeNode],
+        result: [String: [WorkspaceProjectTreeNode]]?,
+        startRevision: Int,
+        startTime: TimeInterval
+    ) {
+        let loadKey = WorkspaceProjectTreeDirectoryLoadKey(
+            projectPath: projectPath,
+            directoryPath: directoryPath
+        )
+        guard stateStore.directoryLoadGenerationByKey[loadKey] == generation,
+              var latestState = stateStore.statesByProjectPath[projectPath],
+              latestState.expandedDirectoryPaths.contains(directoryPath),
+              latestState.childrenByDirectoryPath[directoryPath] == sourceChildren
+        else {
+            return
+        }
+
+        stateStore.directoryLoadTasksByKey[loadKey] = nil
+        guard let result, !result.isEmpty else {
+            return
+        }
+        var didMerge = false
+        for (path, loadedChildren) in result where latestState.childrenByDirectoryPath[path] != loadedChildren {
+            latestState.childrenByDirectoryPath[path] = loadedChildren
+            didMerge = true
+        }
+        guard didMerge else {
+            return
+        }
+        latestState.advanceStructureRevision()
+        let finalizedState = latestState.canonicalizedForDisplay()
+        stateStore.statesByProjectPath[projectPath] = finalizedState
+        diagnostics.recordDirectoryLoadFinished(
+            projectPath: projectPath,
+            directoryPath: directoryPath,
+            revision: max(startRevision, finalizedState.revision),
+            durationMs: elapsedMillisecondsSince(startTime),
+            loadedDirectoryCount: result.count,
+            directChildCount: sourceChildren.count,
+            status: "success",
+            errorDescription: nil
+        )
+    }
+
+    private func invalidateDirectoryLoad(projectPath: String, directoryPath: String) {
+        let normalizedDirectoryPath = normalizePath(directoryPath)
+        let loadKeys = stateStore.directoryLoadGenerationByKey.keys.filter {
+            $0.projectPath == projectPath
+                && ($0.directoryPath == normalizedDirectoryPath
+                    || $0.directoryPath.hasPrefix(normalizedDirectoryPath + "/"))
+        }
+        guard !loadKeys.isEmpty else {
+            let loadKey = WorkspaceProjectTreeDirectoryLoadKey(
+                projectPath: projectPath,
+                directoryPath: normalizedDirectoryPath
+            )
+            stateStore.directoryLoadTasksByKey.removeValue(forKey: loadKey)?.cancel()
+            stateStore.directoryLoadGenerationByKey[loadKey] =
+                (stateStore.directoryLoadGenerationByKey[loadKey] ?? 0) &+ 1
+            return
+        }
+        for loadKey in loadKeys {
+            stateStore.directoryLoadTasksByKey.removeValue(forKey: loadKey)?.cancel()
+            stateStore.directoryLoadGenerationByKey[loadKey] =
+                (stateStore.directoryLoadGenerationByKey[loadKey] ?? 0) &+ 1
+        }
+    }
+
+    private func invalidateDirectoryLoads(for projectPath: String) {
+        let loadKeys = Set(
+            stateStore.directoryLoadGenerationByKey.keys.filter { $0.projectPath == projectPath }
+                + stateStore.directoryLoadTasksByKey.keys.filter { $0.projectPath == projectPath }
+        )
+        for loadKey in loadKeys {
+            stateStore.directoryLoadTasksByKey.removeValue(forKey: loadKey)?.cancel()
+            stateStore.directoryLoadGenerationByKey[loadKey] =
+                (stateStore.directoryLoadGenerationByKey[loadKey] ?? 0) &+ 1
         }
     }
 
@@ -317,6 +446,7 @@ final class WorkspaceProjectTreeController {
         stateStore.refreshGenerationByProjectPath[normalizedProjectPath] = nextGeneration
         stateStore.refreshingProjectPaths.insert(normalizedProjectPath)
         stateStore.refreshTasksByProjectPath[normalizedProjectPath]?.cancel()
+        invalidateDirectoryLoads(for: normalizedProjectPath)
 
         let fileSystemService = fileSystemService
         let startTime = ProcessInfo.processInfo.systemUptime
@@ -436,20 +566,20 @@ final class WorkspaceProjectTreeController {
     }
 
     nonisolated private static func loadChildrenSnapshot(
-        service: WorkspaceFileSystemService,
+        listDirectory: @Sendable (String) throws -> [WorkspaceProjectTreeNode],
         directoryPath: String,
         projectRootPath: String
     ) throws -> WorkspaceProjectTreeDirectoryLoadResult {
         let normalizedDirectoryPath = normalizePathForCompare(directoryPath)
         let normalizedProjectRootPath = normalizePathForCompare(projectRootPath)
-        let children = try service.listDirectory(at: normalizedDirectoryPath)
+        let children = try listDirectory(normalizedDirectoryPath)
         var loadedChildrenByDirectoryPath: [String: [WorkspaceProjectTreeNode]] = [
             normalizedDirectoryPath: children
         ]
 
         for child in children where child.isDirectory {
             try preloadDisplayChain(
-                service: service,
+                listDirectory: listDirectory,
                 startingAt: child,
                 projectRootPath: normalizedProjectRootPath,
                 into: &loadedChildrenByDirectoryPath
@@ -477,7 +607,7 @@ final class WorkspaceProjectTreeController {
         nextState.childrenByDirectoryPath[normalizedProjectPath] = rootNodes
 
         let rootProjectionChildren = try preloadVisibleChainsSnapshot(
-            service: service,
+            listDirectory: { path in try service.listDirectory(at: path) },
             children: rootNodes,
             projectRootPath: normalizedProjectPath
         )
@@ -494,7 +624,7 @@ final class WorkspaceProjectTreeController {
         nextState.loadingDirectoryPaths = []
         for directoryPath in expandedPaths {
             let result = try loadChildrenSnapshot(
-                service: service,
+                listDirectory: { path in try service.listDirectory(at: path) },
                 directoryPath: directoryPath,
                 projectRootPath: normalizedProjectPath
             )
@@ -514,7 +644,7 @@ final class WorkspaceProjectTreeController {
     }
 
     nonisolated private static func preloadVisibleChainsSnapshot(
-        service: WorkspaceFileSystemService,
+        listDirectory: @Sendable (String) throws -> [WorkspaceProjectTreeNode],
         children: [WorkspaceProjectTreeNode],
         projectRootPath: String
     ) throws -> [String: [WorkspaceProjectTreeNode]] {
@@ -522,7 +652,7 @@ final class WorkspaceProjectTreeController {
         var loadedChildrenByDirectoryPath: [String: [WorkspaceProjectTreeNode]] = [:]
         for child in children where child.isDirectory {
             try preloadDisplayChain(
-                service: service,
+                listDirectory: listDirectory,
                 startingAt: child,
                 projectRootPath: normalizedProjectRootPath,
                 into: &loadedChildrenByDirectoryPath
@@ -532,7 +662,7 @@ final class WorkspaceProjectTreeController {
     }
 
     nonisolated private static func preloadDisplayChain(
-        service: WorkspaceFileSystemService,
+        listDirectory: @Sendable (String) throws -> [WorkspaceProjectTreeNode],
         startingAt node: WorkspaceProjectTreeNode,
         projectRootPath: String,
         into loadedChildrenByDirectoryPath: inout [String: [WorkspaceProjectTreeNode]]
@@ -550,7 +680,7 @@ final class WorkspaceProjectTreeController {
         var currentNode = node
         while true {
             let currentPath = normalizePathForCompare(currentNode.path)
-            let children = try service.listDirectory(at: currentPath)
+            let children = try listDirectory(currentPath)
             loadedChildrenByDirectoryPath[currentPath] = children
             guard let nextNode = WorkspaceProjectTreeJavaPackageSupport.compactedChildDirectory(
                 children: children,
